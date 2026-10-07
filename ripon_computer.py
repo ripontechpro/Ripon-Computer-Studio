@@ -12,10 +12,11 @@ import cv2
 from PIL import Image, ImageOps, ImageDraw, ImageEnhance, ImageFont
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
                                QComboBox, QFileDialog, QMessageBox, QSpinBox, QCheckBox, QSlider,
-                               QGroupBox, QScrollArea, QStackedWidget, QColorDialog, QMenuBar, QLineEdit)
+                               QGroupBox, QScrollArea, QStackedWidget, QColorDialog, QMenuBar, QLineEdit,
+                               QProgressBar, QFrame)
 from PySide6.QtGui import (QPixmap, QImage, QPainter, QPen, QColor, QPainterPath, QPolygonF,
                            QShortcut, QKeySequence, QAction)
-from PySide6.QtCore import Qt, QRectF, QPointF
+from PySide6.QtCore import Qt, QRectF, QPointF, QObject, Signal, Slot, QThread, QTimer
 
 # ---- Dokan er size ekhane change korte paro (mm) ----
 SIZES = {
@@ -104,13 +105,32 @@ def skin_tone_up(rgb, mask, strength):
 # ------------------- RIPON: AI / RETOUCH / STUDIO TOOLS -------------------
 _ai = {}
 
+def _torch_device():
+    try:
+        import torch
+        return ("cuda" if torch.cuda.is_available() else "cpu"), torch
+    except Exception:
+        return "cpu", None
+
 def _gfpgan():
     if "gfpgan" not in _ai:
         try:
             from gfpgan import GFPGANer
+            device, _ = _torch_device()
             _ai["gfpgan"] = GFPGANer(
                 model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
-                upscale=1, arch="clean", channel_multiplier=2, bg_upsampler=None)
+                upscale=1, arch="clean", channel_multiplier=2, bg_upsampler=None,
+                device=device)
+            _ai["gfpgan_device"] = device
+        except TypeError:
+            try:
+                from gfpgan import GFPGANer
+                _ai["gfpgan"] = GFPGANer(
+                    model_path="https://github.com/TencentARC/GFPGAN/releases/download/v1.3.0/GFPGANv1.4.pth",
+                    upscale=1, arch="clean", channel_multiplier=2, bg_upsampler=None)
+                _ai["gfpgan_device"] = _torch_device()[0]
+            except Exception as e:
+                _ai["gfpgan"] = None; _ai["gfpgan_err"] = str(e)
         except Exception as e:
             _ai["gfpgan"] = None; _ai["gfpgan_err"] = str(e)
     return _ai["gfpgan"]
@@ -129,12 +149,16 @@ def _esrgan():
         try:
             from realesrgan import RealESRGANer
             from basicsr.archs.rrdbnet_arch import RRDBNet
+            device, torch = _torch_device()
             m = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
             _ai["esr"] = RealESRGANer(
                 scale=4, model_path="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
-                model=m, tile=400, tile_pad=10, pre_pad=0, half=False)
-        except Exception:
+                model=m, tile=400, tile_pad=10, pre_pad=0,
+                half=bool(device == "cuda"), gpu_id=0 if device == "cuda" else None)
+            _ai["esr_device"] = device
+        except Exception as e:
             _ai["esr"] = None
+            _ai["esr_err"] = str(e)
     return _ai["esr"]
 
 def upscale2x(pil_img):
@@ -447,6 +471,159 @@ def make_a4(photo, copies):
             n += 1
         y += ph + gap
     return sheet
+
+
+# ------------------- V2 PERFORMANCE ENGINE -------------------
+# All long-running AI/CPU jobs live in one persistent worker thread. The UI thread
+# is reserved for Qt painting/input, so sliders, crop, menus and preview stay responsive.
+
+def run_auto_pipeline(arr, face, settings, model_name, hair_rgb):
+    """Pure processing pipeline used by the worker. No Qt/UI access here."""
+    notes = []
+    arr = np.ascontiguousarray(arr)
+    alpha = None
+    if settings.get("enh"):
+        arr = enhance_pro(arr, settings.get("enh_strength", 60))
+    if settings.get("face_ai"):
+        try:
+            arr = ai_face_restore(arr, settings.get("face_strength", 50) / 100.0)
+        except Exception as e:
+            notes.append("AI Face skip: " + (str(e).splitlines() or [""])[0][:90])
+    skin_on = settings.get("smooth") or settings.get("tone") or settings.get("shine")
+    if face is not None:
+        mask = skin_mask(arr, face) if skin_on else None
+        if settings.get("pimple"):
+            arr, _ = remove_blemishes(arr, face, settings.get("pimple_strength", 55))
+        if settings.get("shine"):
+            if mask is None: mask = skin_mask(arr, face)
+            arr = skin_shine_fix(arr, mask, 60)
+        if settings.get("smooth"):
+            if mask is None: mask = skin_mask(arr, face)
+            arr = skin_retouch(arr, mask, face, settings.get("smooth_strength", 50))
+        if settings.get("tone"):
+            if mask is None: mask = skin_mask(arr, face)
+            arr = skin_tone_up(arr, mask, settings.get("tone_strength", 50))
+    elif skin_on or settings.get("pimple"):
+        notes.append("Face paini, skin/pimple skip")
+    person = None
+    if settings.get("bg") or settings.get("hair"):
+        try:
+            person = remove_bg(Image.fromarray(arr), model_name).getchannel("A")
+        except Exception as e:
+            if settings.get("bg"):
+                raise
+            notes.append("Hair segmentation skip: " + (str(e).splitlines() or [""])[0][:90])
+    hair_mask = None
+    if settings.get("hair"):
+        if face is None:
+            notes.append("Face paini, hair skip")
+        else:
+            person_np = None if person is None else np.array(person, np.float32) / 255.0
+            hair_mask = hair_mask_auto(arr, face, person_np)
+            arr = apply_hair_color(arr, hair_mask, hair_rgb, settings.get("hair_strength", 100))
+    if settings.get("bg"):
+        alpha = person
+    return arr, alpha, hair_mask, notes
+
+class AIWorker(QObject):
+    request = Signal(str, object)
+    finished = Signal(str, object)
+    failed = Signal(str, str)
+    progress = Signal(str)
+
+    def __init__(self):
+        super().__init__()
+        self.request.connect(self.execute)
+
+    @Slot(str, object)
+    def execute(self, kind, payload):
+        try:
+            if kind == "preload":
+                self.progress.emit("AI startup: preparing models...")
+                # Load the default/selected segmentation model first because it is
+                # the most commonly used shop operation.
+                model = payload.get("model", "u2net_human_seg")
+                try:
+                    remove_bg(Image.new("RGB", (32, 32), (255, 255, 255)), model)
+                except Exception:
+                    # Optional AI must never prevent the application from opening.
+                    pass
+                self.progress.emit("AI startup: loading face restore...")
+                try: _gfpgan()
+                except Exception: pass
+                self.progress.emit("AI startup: loading upscale...")
+                try: _esrgan()
+                except Exception: pass
+                self.finished.emit(kind, {"ready": True})
+                return
+
+            if kind == "bg":
+                self.progress.emit("Background remove processing...")
+                out = remove_bg(payload["image"], payload["model"]).getchannel("A")
+                self.finished.emit(kind, out)
+                return
+
+            if kind == "face":
+                self.progress.emit("AI Face Restore processing...")
+                out = ai_face_restore(payload["arr"], payload["weight"])
+                self.finished.emit(kind, out)
+                return
+
+            if kind == "upscale":
+                self.progress.emit("AI Upscale processing...")
+                out, how = upscale2x(payload["image"])
+                self.finished.emit(kind, (out, how))
+                return
+
+            if kind == "auto":
+                self.progress.emit("Auto processing...")
+                result = run_auto_pipeline(payload["arr"], payload["face"], payload["settings"], payload["model"], payload["hair_rgb"])
+                self.finished.emit(kind, result)
+                return
+
+            if kind == "hairmask":
+                self.progress.emit("Chuler jaiga khujchi...")
+                person = None
+                if payload.get("alpha") is not None:
+                    person = payload["alpha"]
+                else:
+                    try:
+                        person = np.array(remove_bg(Image.fromarray(payload["arr"]), payload["model"]).getchannel("A"), np.float32) / 255.0
+                    except Exception:
+                        person = None
+                result = hair_mask_auto(payload["arr"], payload["face"], person)
+                self.finished.emit(kind, result)
+                return
+
+            # CPU operations also run off the GUI thread. This is important for
+            # large photos because bilateral filters and connected-components can
+            # otherwise freeze Qt even without AI models.
+            arr = payload["arr"]
+            face = payload.get("face")
+            if kind == "enhance":
+                result = enhance_pro(arr, payload["strength"])
+            elif kind == "smooth":
+                mask = skin_mask(arr, face)
+                result = skin_smooth(arr, mask, face, payload["strength"])
+            elif kind == "tone":
+                mask = skin_mask(arr, face)
+                result = skin_tone_up(arr, mask, payload["strength"])
+            elif kind == "retouch":
+                mask = skin_mask(arr, face)
+                result = skin_retouch(arr, mask, face, payload["strength"])
+            elif kind == "shine":
+                mask = skin_mask(arr, face)
+                result = skin_shine_fix(arr, mask, payload["strength"])
+            elif kind == "pimple":
+                result = remove_blemishes(arr, face, payload["strength"])
+            elif kind == "hair":
+                hm = payload["mask"]
+                result = apply_hair_color(arr, hm, payload["color"], payload["strength"])
+            else:
+                raise RuntimeError("Unknown worker task: " + kind)
+            self.finished.emit(kind, result)
+        except Exception as e:
+            self.failed.emit(kind, str(e))
 
 # ------------------- GUI -------------------
 def pil_to_pixmap(im):
@@ -1070,7 +1247,10 @@ class App(QWidget):
         if self.stack.currentIndex() != 2: return
         tool = RT_TOOLS[i]; self.paint_view.tool = tool
         if tool.startswith("hair") and self.paint_view.ov is None and self.face is not None:
-            self.hair_detect(); self.paint_view.set_overlay(self.hair_mask)
+            if self.hair_mask is not None and self.hair_mask.shape == (self.rgb.height, self.rgb.width):
+                self.paint_view.set_overlay(self.hair_mask)
+            else:
+                self.hair_detect()
         self.paint_view.update()
         self.status.setText("Pimple er upor click koro (brush = pimple er cheye ektu boro). Scroll = zoom, Right-drag = sorano. Enter = Done, Esc = Cancel"
                             if tool == "heal" else
@@ -1366,7 +1546,478 @@ class App(QWidget):
         if hasattr(os, "startfile"): os.startfile(p, "print")
         else: QMessageBox.information(self, "Print", "Saved: " + p + "\nEta khule print koro.")
 
+
+
+# ------------------- FIXED PROCESSING INDICATOR -------------------
+class ProcessingBanner(QFrame):
+    """Editor-er ekdom upore fixed processing indicator.
+    Heavy job cholche kina chokhe dekha jay: spinner + moving progress bar + live message.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("ProcessingBanner")
+        self.setFrameShape(QFrame.StyledPanel)
+        self.setStyleSheet("""
+            QFrame#ProcessingBanner {
+                background: #17212b;
+                border: 1px solid #3d5366;
+                border-radius: 8px;
+            }
+            QLabel#ProcessTitle { color: #ffffff; font-size: 14px; font-weight: 700; }
+            QLabel#ProcessMessage { color: #d7e5ef; font-size: 13px; }
+            QLabel#ProcessSpinner { color: #42a5f5; font-size: 18px; font-weight: 700; min-width: 24px; }
+            QProgressBar {
+                border: 0;
+                background: #263746;
+                border-radius: 3px;
+                height: 5px;
+            }
+            QProgressBar::chunk { background: #42a5f5; border-radius: 3px; }
+        """)
+        self.spinner = QLabel("●")
+        self.spinner.setObjectName("ProcessSpinner")
+        self.title = QLabel("READY")
+        self.title.setObjectName("ProcessTitle")
+        self.message = QLabel("Photo Studio ready")
+        self.message.setObjectName("ProcessMessage")
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 0)  # indeterminate / animated busy bar
+        self.bar.setTextVisible(False)
+        self.bar.setMaximumHeight(5)
+        self.bar.setVisible(False)
+
+        text_col = QVBoxLayout()
+        text_col.setContentsMargins(0, 0, 0, 0)
+        text_col.setSpacing(1)
+        text_col.addWidget(self.title)
+        text_col.addWidget(self.message)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(10, 7, 10, 3)
+        top.setSpacing(8)
+        top.addWidget(self.spinner)
+        top.addLayout(text_col, 1)
+        self.setLayout(QVBoxLayout())
+        self.layout().setContentsMargins(0, 0, 0, 0)
+        self.layout().setSpacing(0)
+        self.layout().addLayout(top)
+        self.layout().addWidget(self.bar)
+
+        self._timer = QTimer(self)
+        self._timer.setInterval(140)
+        self._timer.timeout.connect(self._tick)
+        self._frames = ["●", "●", "●", "●"]
+        self._frame = 0
+        self.setVisible(False)
+
+    def _tick(self):
+        # Subtle spinner animation; no GIF/image overhead.
+        self._frame = (self._frame + 1) % len(self._frames)
+        dots = "." * (self._frame + 1)
+        self.spinner.setText("◉" if self._frame % 2 else "●")
+        self.title.setText("PROCESSING" + dots)
+
+    def start(self, message):
+        self.message.setText(message or "Processing...")
+        self.title.setText("PROCESSING...")
+        self.bar.setVisible(True)
+        self.setVisible(True)
+        self._frame = 0
+        self._timer.start()
+        self.raise_()
+
+    def update_message(self, message):
+        if message:
+            self.message.setText(message)
+        if not self.isVisible():
+            self.setVisible(True)
+            self.bar.setVisible(True)
+            self._timer.start()
+
+    def stop(self, message="Ready"):
+        self._timer.stop()
+        self.spinner.setText("✓")
+        self.title.setText("DONE")
+        self.message.setText(message)
+        self.bar.setVisible(False)
+        # Keep it visible briefly so the user sees the result, then hide.
+        QTimer.singleShot(900, self.hide)
+
+# ------------------- APP V2 -------------------
+class AppV2(App):
+    """Performance-focused V2 built directly on the original App feature set.
+
+    Design rules:
+      * Qt thread = UI only.
+      * One persistent worker = AI/large CPU jobs.
+      * AI models are warmed up at startup.
+      * Preview is generated at display resolution, never from a full-size QPixmap.
+      * Final export still uses full resolution.
+      * Adjustment sliders are debounced instead of recalculating every mouse tick.
+      * Expensive masks are cached per working-image revision.
+    """
+    PREVIEW_MAX = 1100
+    ADJUST_DEBOUNCE_MS = 70
+
+    def __init__(self):
+        self._v2_revision = 0
+        self._cache = {}
+        self._job_active = False
+        self._pending_adjust = False
+        self._adjust_timer = QTimer()
+        self._adjust_timer.setSingleShot(True)
+        self._adjust_timer.setInterval(self.ADJUST_DEBOUNCE_MS)
+        self._adjust_timer.timeout.connect(self._apply_adjust_now)
+        self._last_display_key = None
+        self._last_display_pixmap = None
+        super().__init__()
+
+        # Fixed top-of-editor processing banner. The old status label remains as
+        # a permanent history/status line, but active processing is always visible.
+        self.process_banner = ProcessingBanner(self)
+        self.layout().insertWidget(0, self.process_banner)
+
+        self._ai_thread = QThread(self)
+        self._ai_worker = AIWorker()
+        self._ai_worker.moveToThread(self._ai_thread)
+        self._ai_worker.finished.connect(self._job_finished)
+        self._ai_worker.failed.connect(self._job_failed)
+        self._ai_worker.progress.connect(self._show_progress)
+        self._ai_thread.started.connect(lambda: self._ai_worker.request.emit("preload", {
+            "model": MODELS[self.model_box.currentText()]
+        }))
+        self._ai_thread.start()
+        self.status.setText("AI startup: loading models in background... UI ready.")
+
+    # ---------- cache / state ----------
+    def _invalidate_cache(self):
+        self._v2_revision += 1
+        self._cache.clear()
+        self._last_display_key = None
+        self._last_display_pixmap = None
+
+    def _set_working_rgb(self, arr_or_img):
+        self.rgb = arr_or_img if isinstance(arr_or_img, Image.Image) else Image.fromarray(np.ascontiguousarray(arr_or_img))
+        self._invalidate_cache()
+
+    def _display_size(self):
+        w = max(320, self.preview.width() - 12)
+        h = max(320, self.preview.height() - 12)
+        return min(self.PREVIEW_MAX, w), min(self.PREVIEW_MAX, h)
+
+    def show_img(self, im):
+        if im is None: return
+        self.stack.setCurrentIndex(0)
+        max_w, max_h = self._display_size()
+        key = (id(im), im.size, max_w, max_h)
+        if key == self._last_display_key and self._last_display_pixmap is not None:
+            self.preview.setPixmap(self._last_display_pixmap)
+            return
+        # Resize PIL first. Converting a 4000-6000px image to QImage on every
+        # preview update was one of the biggest hidden UI costs in V1.
+        if im.width > max_w or im.height > max_h:
+            view = im.copy()
+            view.thumbnail((max_w, max_h), Image.Resampling.LANCZOS)
+        else:
+            view = im
+        pm = pil_to_pixmap(view)
+        self._last_display_key = key
+        self._last_display_pixmap = pm
+        self.preview.setPixmap(pm)
+
+    def source(self):
+        im = self.rgb.convert("RGBA")
+        if self.alpha is not None:
+            im.putalpha(self.alpha)
+        return im
+
+    def composite(self):
+        if self.alpha is None: return self.rgb
+        c = Image.new("RGB", self.rgb.size, self.bg_rgb)
+        c.paste(self.rgb, (0, 0), self.alpha)
+        return c
+
+    def after_change(self):
+        if self.rgb is None: return
+        self._invalidate_cache()
+        if self.stack.currentIndex() == 1:
+            self.refresh_preview()
+        elif self.photo_base is not None:
+            self.apply_crop()
+        else:
+            self.show_img(self.composite())
+
+    def push(self):
+        # The image objects are immutable from the editor's point of view: every
+        # edit assigns a new PIL image/array. Therefore history does not need an
+        # immediate deep copy of every 4096px frame.
+        self.history.append(self._snap())
+        self.history = self.history[-12:]
+        self.redo_stack = []
+
+    def _snap(self):
+        return dict(rgb=self.rgb, alpha=self.alpha, orig=self.orig, face=self.face,
+                    box=list(self.box) if self.box else None, base_h=self.base_h,
+                    cropped=self.photo_base is not None)
+
+    # ---------- non-blocking jobs ----------
+    def _show_progress(self, message):
+        self.status.setText(message)
+        if hasattr(self, "process_banner"):
+            self.process_banner.update_message(message)
+
+    def _submit(self, kind, payload, message=None, history=False):
+        if self._job_active:
+            self.status.setText("Ekta processing already cholche. Oita shesh hole abar chapo.")
+            return False
+        if history:
+            self.push()
+        self._job_active = True
+        msg = message or "Processing..."
+        self.status.setText(msg)
+        self.process_banner.start(msg)
+        self._ai_worker.request.emit(kind, payload)
+        return True
+
+    def _job_finished(self, kind, result):
+        self._job_active = False
+        try:
+            if kind == "preload":
+                self.status.setText("AI Ready — models warm. Photo Studio is ready.")
+                self.process_banner.stop("AI models ready — Photo Studio is ready")
+                return
+            if kind == "bg":
+                self.alpha = result
+                self._invalidate_cache(); self.after_change()
+                self.status.setText("Background remove holo.")
+                self.process_banner.stop("Background remove complete")
+                return
+            if kind == "face":
+                self.push(); self._set_working_rgb(result)
+                self.after_change(); self.status.setText("AI Face Restore holo.")
+                self.process_banner.stop("AI Face Restore complete")
+                return
+            if kind == "upscale":
+                big, how = result
+                old_size = self.rgb.size
+                self.push()
+                k = big.width / max(1, old_size[0])
+                if self.orig is not None:
+                    self.orig = self.orig.resize(big.size, Image.Resampling.LANCZOS)
+                if self.alpha is not None:
+                    self.alpha = self.alpha.resize(big.size, Image.Resampling.LANCZOS)
+                self._set_working_rgb(big)
+                if self.face is not None: self.face = tuple(int(v * k) for v in self.face)
+                if self.box is not None:
+                    self.box = [self.box[0] * k, self.box[1] * k, self.box[2] * k, self.box[3]]
+                    self.base_h *= k
+                self.hair_mask = None
+                self.after_change(); self.status.setText("Upscale holo: " + how)
+                self.process_banner.stop("Upscale complete — " + how)
+                return
+            if kind == "auto":
+                arr, alpha, hm, notes = result
+                self._set_working_rgb(arr)
+                self.alpha = alpha; self.hair_mask = hm
+                self.box = auto_box(self.rgb, self.face, self.ratio(), self.c_crop.isChecked())
+                self.base_h = self.box[2]
+                self.s_zoom.blockSignals(True); self.s_zoom.setValue(100); self.s_zoom.blockSignals(False)
+                self.s_tilt.blockSignals(True); self.s_tilt.setValue(0); self.s_tilt.blockSignals(False)
+                if self.c_manual.isChecked() or (self.face is None and self.c_crop.isChecked()):
+                    self.open_editor()
+                    if self.face is None: self.status.setText("Face paini: manual box sorao, tarpor Enter chapo")
+                else:
+                    self.apply_crop()
+                if notes: self.status.setText(self.status.text() + "   [" + " | ".join(notes) + "]")
+                self.process_banner.stop("Auto processing complete")
+                return
+            if kind == "hairmask":
+                self.hair_mask = result
+                if self.stack.currentIndex() == 2:
+                    self.paint_view.set_overlay(self.hair_mask)
+                self.status.setText("Hair area ready.")
+                self.process_banner.stop("Hair area detection complete")
+                return
+            if kind in ("enhance", "smooth", "tone", "retouch", "shine", "hair"):
+                self._set_working_rgb(result)
+                self.after_change()
+                labels = {"enhance":"Photo Enhance PRO holo", "smooth":"Skin smooth holo",
+                          "tone":"Skin tone up holo", "retouch":"Skin retouch holo",
+                          "shine":"Oily shine komano holo", "hair":"Hair color holo"}
+                self.status.setText(labels[kind])
+                self.process_banner.stop("Operation complete")
+                return
+            if kind == "pimple":
+                arr, n = result
+                self._set_working_rgb(arr); self.after_change()
+                self.status.setText(f"{n} ta pimple/dag remove holo.")
+                self.process_banner.stop(f"{n} ta pimple/dag remove complete")
+        except Exception as e:
+            self._job_failed(kind, str(e))
+
+    def _job_failed(self, kind, error):
+        self._job_active = False
+        if self.history and kind in ("bg", "face", "upscale", "auto", "enhance", "smooth", "tone", "retouch", "shine", "pimple", "hair"):
+            # Failed jobs produced no new state, so discard their pending history snapshot.
+            self.history.pop()
+        self.status.setText("Processing failed")
+        if hasattr(self, "process_banner"):
+            self.process_banner.stop("Processing failed — details below")
+        QMessageBox.warning(self, "Ripon Computer", f"{kind} hoyni.\n\n{error[:1000]}")
+
+    # ---------- open / masks ----------
+    def open_photo(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Photo", "", "Images (*.jpg *.jpeg *.png *.webp)")
+        if not p: return
+        try:
+            im = ImageOps.exif_transpose(Image.open(p)).convert("RGB")
+            if max(im.size) > 4096:
+                im.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+        except Exception as e:
+            QMessageBox.critical(self, "Open", str(e)); return
+        self.orig = im; self.rgb = im; self.alpha = None
+        self.history = []; self.redo_stack = []; self.hair_mask = None
+        self.face = detect_face(np.array(im))
+        self.box = None; self.photo_base = self.photo = self.sheet = None
+        self._invalidate_cache(); self.show_img(im)
+        self.status.setText("Photo loaded. " + ("Face detect holo." if self.face else "Face paini."))
+
+    def _cached_skin_mask(self):
+        key = ("skin", self._v2_revision, self.face)
+        if key not in self._cache:
+            self._cache[key] = skin_mask(np.array(self.rgb), self.face)
+        return self._cache[key]
+
+    # ---------- async manual effects ----------
+    def m_bg_remove(self):
+        if not self.need_img(): return
+        self._submit("bg", {"image": self.rgb.copy(), "model": MODELS[self.model_box.currentText()]},
+                     "Background remove hochche... AI startup e preload hocche.", history=True)
+
+    def m_bg_restore(self):
+        if self.need_img():
+            self.push(); self.alpha = None; self.after_change(); self.status.setText("Original background fire ashlo")
+
+    def m_enhance(self):
+        if self.need_img():
+            self._submit("enhance", {"arr": np.array(self.rgb), "strength": self.s_enh.value()},
+                         "Photo Enhance PRO...", history=True)
+
+    def _need_face(self):
+        if not self.need_img(): return False
+        if self.face is None:
+            QMessageBox.information(self, "Face paini", "Skin effect er jonno face detect lagbe.")
+            return False
+        return True
+
+    def m_smooth(self):
+        if self._need_face():
+            self._submit("smooth", {"arr": np.array(self.rgb), "face": self.face, "strength": self.s_smooth.value()},
+                         "Skin smooth...", history=True)
+
+    def m_tone(self):
+        if self._need_face():
+            self._submit("tone", {"arr": np.array(self.rgb), "face": self.face, "strength": self.s_tone.value()},
+                         "Skin tone...", history=True)
+
+    def m_retouch(self):
+        if self._need_face():
+            self._submit("retouch", {"arr": np.array(self.rgb), "face": self.face, "strength": self.s_smooth.value()},
+                         "Skin retouch...", history=True)
+
+    def m_shine(self):
+        if self._need_face():
+            self._submit("shine", {"arr": np.array(self.rgb), "face": self.face, "strength": 70},
+                         "Oily shine fix...", history=True)
+
+    def m_pimple(self):
+        if self._need_face():
+            self._submit("pimple", {"arr": np.array(self.rgb), "face": self.face, "strength": self.s_pimple.value()},
+                         "Pimple/dag khujchi...", history=True)
+
+    def m_face_ai(self):
+        if self.need_img():
+            self._submit("face", {"arr": np.array(self.rgb), "weight": self.s_aiface.value() / 100.0},
+                         "AI Face Restore...", history=True)
+
+    def m_upscale(self):
+        if not self.need_img(): return
+        if max(self.rgb.size) >= 2400:
+            self.status.setText("Photo already boro (2400px+), upscale dorkar nai"); return
+        self._submit("upscale", {"image": self.rgb.copy()}, "AI Upscale 2x...", history=True)
+
+    def hair_detect(self):
+        if not self._need_face(): return False
+        if self.hair_mask is not None and self.hair_mask.shape == (self.rgb.height, self.rgb.width):
+            return True
+        return self._submit("hairmask", {
+            "arr": np.array(self.rgb), "face": self.face, "alpha": None if self.alpha is None else np.array(self.alpha),
+            "model": MODELS[self.model_box.currentText()]
+        }, "Chuler jaiga khujchi...")
+
+    def m_hair(self, color=None):
+        if not self.need_img(): return
+        if self.hair_mask is None or self.hair_mask.shape != (self.rgb.height, self.rgb.width):
+            if not self.hair_detect(): return
+            self.status.setText("Hair mask ready hole abar Hair Color Apply chapo.")
+            return
+        if (self.hair_mask > 0.5).sum() < 200:
+            QMessageBox.information(self, "Chul paini", "Chuler jaiga auto dhora jayni. Area Edit diye brush koro.")
+            return
+        self._submit("hair", {"arr": np.array(self.rgb), "mask": self.hair_mask.copy(),
+                               "color": color or self.hair_rgb, "strength": self.s_hair.value()},
+                     "Hair color...", history=True)
+
+    # ---------- fast preview adjustment ----------
+    def apply_adjust(self, *_):
+        if self.photo_base is None: return
+        self._pending_adjust = True
+        self._adjust_timer.start()
+
+    def _apply_adjust_now(self):
+        self._pending_adjust = False
+        if self.photo_base is None: return
+        self.photo = self.adjust(self.photo_base)
+        self.sheet = None
+        if self.stack.currentIndex() == 0: self.show_img(self.photo)
+
+    def refresh_preview(self):
+        if self.rgb is None: return
+        small = self.source()
+        small.thumbnail((self.PREVIEW_MAX, self.PREVIEW_MAX), Image.Resampling.LANCZOS)
+        self.crop_view.set_preview(render_preview(small, self.bg_rgb, 0))
+
+    # ---------- async AUTO ----------
+    def run_auto(self):
+        if not self.need_img(): return
+        if self._job_active:
+            self.status.setText("Ekta processing already cholche."); return
+        self.alpha = None
+        settings = {
+            "enh": self.c_enh.isChecked(), "enh_strength": self.s_enh.value(),
+            "face_ai": self.c_face.isChecked(), "face_strength": self.s_aiface.value(),
+            "pimple": self.c_pimple.isChecked(), "pimple_strength": self.s_pimple.value(),
+            "smooth": self.c_smooth.isChecked(), "smooth_strength": self.s_smooth.value(),
+            "tone": self.c_tone.isChecked(), "tone_strength": self.s_tone.value(),
+            "shine": self.c_shine.isChecked(), "bg": self.c_bg.isChecked(),
+            "hair": self.c_hair.isChecked(), "hair_strength": self.s_hair.value(),
+        }
+        ok = self._submit("auto", {"arr": np.array(self.orig if self.orig is not None else self.rgb),
+                                     "face": self.face, "settings": settings,
+                                     "model": MODELS[self.model_box.currentText()], "hair_rgb": self.hair_rgb},
+                          "Auto processing... UI responsive thakbe.", history=True)
+
+    # ---------- shutdown ----------
+    def closeEvent(self, event):
+        try:
+            self._adjust_timer.stop()
+            if hasattr(self, "_ai_thread"):
+                self._ai_thread.quit()
+                self._ai_thread.wait(3000)
+        finally:
+            event.accept()
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     app.setApplicationName(APP_NAME)
-    w = App(); w.show(); sys.exit(app.exec())
+    w = AppV2(); w.show(); sys.exit(app.exec())
