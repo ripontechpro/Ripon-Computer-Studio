@@ -1,0 +1,16 @@
+# Ripon Computer - Photo Studio
+# Install:  pip install -r requirements.txt
+
+PySide6
+opencv-python
+numpy
+Pillow
+rembg
+onnxruntime
+
+# ---- Optional AI (GPU/torch lagbe, na install korleo software cholbe) ----
+# AI Face Restore ar AI Upscale 2x er jonno, niche # tule dao:
+# torch
+# torchvision
+# gfpgan
+# realesrgan
