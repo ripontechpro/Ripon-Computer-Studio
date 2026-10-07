@@ -406,17 +406,65 @@ def save_online(im, path, kb, size_px=None):
     return None
 
 # ------------------- STATE HELPERS -------------------
+_CASCADES = None
+def _load_cascades():
+    global _CASCADES
+    if _CASCADES is None:
+        _CASCADES = {}
+        for key, fn in (("default", "haarcascade_frontalface_default.xml"),
+                        ("alt2", "haarcascade_frontalface_alt2.xml"),
+                        ("alt", "haarcascade_frontalface_alt.xml"),
+                        ("profile", "haarcascade_profileface.xml")):
+            try:
+                c = cv2.CascadeClassifier(cv2.data.haarcascades + fn)
+                if not c.empty(): _CASCADES[key] = c
+            except Exception:
+                pass
+    return _CASCADES
+
 def detect_face(rgb):
-    if face_cascade is None: return None
+    """Face (x, y, w, h) image pixel e. Onek rokom cascade + halka ghuriye + profile try kore.
+    Na pele None (tokhon user 'Face Manual' diye nijei box ankon korbe)."""
     try:
+        cas = _load_cascades()
+        if not cas: return None
         gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
         s = min(1.0, 1200.0 / max(gray.shape))
         g = cv2.resize(gray, None, fx=s, fy=s, interpolation=cv2.INTER_AREA) if s < 1 else gray
-        for sf, nb, ms in ((1.1, 5, 60), (1.05, 3, 40)):
-            faces = face_cascade.detectMultiScale(g, sf, nb, minSize=(ms, ms))
-            if len(faces):
-                f = max(faces, key=lambda f: f[2] * f[3])
-                return tuple(int(v / s) for v in f)
+        g = cv2.equalizeHist(g)
+        H, W = g.shape
+        # (angle, cascades, scaleFactor, minNeighbors, minSize)
+        attempts = [
+            (0, ("default",), 1.1, 5, 60),
+            (0, ("default", "alt2"), 1.05, 3, 40),
+            (0, ("alt2", "alt", "default"), 1.04, 2, 30),
+            (-15, ("default", "alt2"), 1.05, 3, 40), (15, ("default", "alt2"), 1.05, 3, 40),
+            (-30, ("default", "alt2"), 1.05, 3, 40), (30, ("default", "alt2"), 1.05, 3, 40),
+            (0, ("profile",), 1.05, 3, 40),
+        ]
+        for ang, names, sf, nb, ms in attempts:
+            if ang:
+                M = cv2.getRotationMatrix2D((W / 2.0, H / 2.0), ang, 1.0)
+                gr = cv2.warpAffine(g, M, (W, H)); inv = cv2.invertAffineTransform(M)
+            else:
+                gr = g; inv = None
+            for nm in names:
+                c = cas.get(nm)
+                if c is None: continue
+                for flip in ((False, True) if nm == "profile" else (False,)):
+                    gg = cv2.flip(gr, 1) if flip else gr
+                    faces = c.detectMultiScale(gg, sf, nb, minSize=(ms, ms))
+                    if not len(faces): continue
+                    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
+                    if flip: x = W - (x + w)
+                    if inv is not None:
+                        cx, cy = x + w / 2.0, y + h / 2.0
+                        cx, cy = inv[0, 0] * cx + inv[0, 1] * cy + inv[0, 2], inv[1, 0] * cx + inv[1, 1] * cy + inv[1, 2]
+                        x, y = cx - w / 2.0, cy - h / 2.0
+                    x, y = max(0.0, x), max(0.0, y)
+                    w, h = min(w, W - x), min(h, H - y)
+                    if w < 10 or h < 10: continue
+                    return tuple(int(v / s) for v in (x, y, w, h))
     except Exception:
         pass
     return None
@@ -844,6 +892,93 @@ class PaintView(QWidget):
         self.pan = QPointF(self.pan.x() + pt.x() - (ox + ix * s), self.pan.y() + pt.y() - (oy + iy * s))
         self.update()
 
+class FacePickView(QWidget):
+    """Manual face box: mouse drag = notun box, box er bhitore drag = sorano, kone tene = boro/chhoto.
+    Box ta bhru (eyebrow) theke thutni (chin) porjonto, duto kan soho hobe. Enter = OK, Esc = Cancel."""
+    HIT = 12
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(560, 650); self.setMouseTracking(True)
+        self.pm = None; self.iw = self.ih = 1; self.box = None      # [x, y, w, h] image pixel
+        self._mode = None; self._st = None
+
+    def set_image(self, arr, face):
+        arr = np.ascontiguousarray(arr); h, w = arr.shape[:2]
+        self.pm = QPixmap.fromImage(QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888).copy())
+        self.iw, self.ih = w, h
+        self.box = [float(v) for v in face] if face is not None else None
+        self._mode = None; self.update()
+
+    def get_box(self):
+        if self.box is None: return None
+        x, y, w, h = self.box
+        x0, y0 = max(0, x), max(0, y); x1, y1 = min(self.iw, x + w), min(self.ih, y + h)
+        if x1 - x0 < 20 or y1 - y0 < 20: return None
+        return (int(x0), int(y0), int(x1 - x0), int(y1 - y0))
+
+    def _geom(self):
+        s = min(self.width() / max(1, self.iw), self.height() / max(1, self.ih))
+        return s, (self.width() - self.iw * s) / 2, (self.height() - self.ih * s) / 2
+
+    def _w2i(self, pt):
+        s, ox, oy = self._geom(); return (pt.x() - ox) / s, (pt.y() - oy) / s
+
+    def _corner_hit(self, ix, iy):
+        if self.box is None: return None
+        x, y, w, h = self.box; r = self.HIT / self._geom()[0]
+        for cx, cy, ax, ay in ((x, y, x + w, y + h), (x + w, y, x, y + h), (x + w, y + h, x, y), (x, y + h, x + w, y)):
+            if abs(ix - cx) < r and abs(iy - cy) < r: return (ax, ay)     # anchor = opposite corner
+        return None
+
+    def paintEvent(self, e):
+        p = QPainter(self); p.fillRect(self.rect(), QColor("#cfcfcf"))
+        if self.pm is None: p.end(); return
+        s, ox, oy = self._geom()
+        p.drawPixmap(QRectF(ox, oy, self.iw * s, self.ih * s), self.pm, QRectF(self.pm.rect()))
+        if self.box is not None:
+            x, y, w, h = self.box
+            r = QRectF(ox + x * s, oy + y * s, w * s, h * s)
+            path = QPainterPath(); path.addRect(QRectF(self.rect())); path.addRect(r)
+            p.fillPath(path, QColor(0, 0, 0, 110))
+            p.setPen(QPen(QColor(0, 230, 118), 2)); p.drawRect(r)
+            for cx, cy in ((r.left(), r.top()), (r.right(), r.top()), (r.right(), r.bottom()), (r.left(), r.bottom())):
+                hr = QRectF(cx - 5, cy - 5, 10, 10); p.fillRect(hr, QColor(255, 255, 255)); p.drawRect(hr)
+        p.setPen(QColor(20, 20, 20)); p.fillRect(QRectF(0, 0, self.width(), 24), QColor(255, 255, 255, 200))
+        p.drawText(8, 17, "Mukh er upor drag kore box ankon koro (bhru theke thutni, duto kan soho)  |  Enter = OK   Esc = Cancel")
+        p.end()
+
+    def mousePressEvent(self, e):
+        if e.button() != Qt.LeftButton: return
+        ix, iy = self._w2i(e.position())
+        anc = self._corner_hit(ix, iy)
+        if anc is not None:
+            self._mode = "resize"; self._st = dict(ax=anc[0], ay=anc[1])
+        elif self.box is not None and self.box[0] <= ix <= self.box[0] + self.box[2] and self.box[1] <= iy <= self.box[1] + self.box[3]:
+            self._mode = "move"; self._st = dict(dx=ix - self.box[0], dy=iy - self.box[1])
+        else:
+            self._mode = "resize"; self._st = dict(ax=ix, ay=iy); self.box = [ix, iy, 0.0, 0.0]
+        self.update()
+
+    def mouseMoveEvent(self, e):
+        ix, iy = self._w2i(e.position())
+        if self._mode is None:
+            if self._corner_hit(ix, iy) is not None: self.setCursor(Qt.SizeFDiagCursor)
+            elif self.box is not None and self.box[0] <= ix <= self.box[0] + self.box[2] and self.box[1] <= iy <= self.box[1] + self.box[3]:
+                self.setCursor(Qt.SizeAllCursor)
+            else: self.setCursor(Qt.CrossCursor)
+            return
+        ix = min(max(ix, 0), self.iw); iy = min(max(iy, 0), self.ih)
+        if self._mode == "resize":
+            ax, ay = self._st["ax"], self._st["ay"]
+            self.box = [min(ax, ix), min(ay, iy), abs(ix - ax), abs(iy - ay)]
+        else:
+            w, h = self.box[2], self.box[3]
+            self.box[0] = min(max(ix - self._st["dx"], 0), self.iw - w)
+            self.box[1] = min(max(iy - self._st["dy"], 0), self.ih - h)
+        self.update()
+
+    def mouseReleaseEvent(self, e): self._mode = None
+
 def hslider(lo, hi, val):
     s = QSlider(Qt.Horizontal); s.setRange(lo, hi); s.setValue(val); return s
 
@@ -888,12 +1023,17 @@ class App(QWidget):
         self.stack.addWidget(self.preview); self.stack.addWidget(self.crop_view)
         self.paint_view = PaintView(); self.paint_view.on_action = self.on_paint_action
         self.stack.addWidget(self.paint_view)
+        self.face_view = FacePickView(); self._pending_face_action = None
+        self.stack.addWidget(self.face_view)
 
         self.size_box = QComboBox(); self.size_box.addItems(SIZES.keys())
         self.size_box.currentIndexChanged.connect(self.on_size_change)
         self.model_box = QComboBox(); self.model_box.addItems(MODELS.keys())
         self.copies = QSpinBox(); self.copies.setRange(1, 60); self.copies.setValue(8)
         self.swatch = QLabel(""); self.swatch.setFixedHeight(28)
+        self.face_lbl = QLabel(""); self.face_lbl.setWordWrap(True)
+        self.face_hint = QLabel("Skin / Pimple / Hair tool er jonno face lage. Auto na paile 'Face Manual' chepe mukh er upor box ankon koro, Enter chapo. Tarpor tool gulo kaj korbe.")
+        self.face_hint.setWordWrap(True)
 
         # AUTO ticks
         self.c_crop = QCheckBox("Auto Crop (face dhore)")
@@ -953,6 +1093,12 @@ class App(QWidget):
             QLabel("Koto beshi hobe: niche AI section er slider theke ney"),
             row(btn("Select All", lambda: self.set_all(True)), btn("Clear", lambda: self.set_all(False))),
             btn("AUTO CHALAO", self.run_auto, "background:#2e7d32;color:white;font-weight:bold;")]))
+
+        side.addWidget(group("FACE DETECT (manual tool er jonno)", [
+            self.face_lbl,
+            row(btn("Face Auto Detect", self.m_face_detect),
+                btn("Face Manual (box ankon)", self.m_face_manual, "background:#00838f;color:white;font-weight:bold;")),
+            self.face_hint]))
 
         side.addWidget(group("AI ENHANCE / SKIN RETOUCH / PIMPLE", [
             QLabel("Enhance strength"), self.s_enh, btn("Photo Enhance PRO", self.m_enhance),
@@ -1020,6 +1166,7 @@ class App(QWidget):
             QShortcut(QKeySequence(key), self).activated.connect(self.on_enter)
         QShortcut(QKeySequence(Qt.Key_Escape), self).activated.connect(self.on_esc)
         self.set_bg(self.bg_rgb)
+        self._update_face_label()
 
     # ---------- helpers ----------
     def set_all(self, v):
@@ -1117,20 +1264,92 @@ class App(QWidget):
         self.push(); self.rgb = Image.fromarray(enhance_pro(np.array(self.rgb), self.s_enh.value())); self.after_change()
         self.status.setText("Photo Enhance PRO holo")
 
-    def _need_face(self):
+    # ---------- FACE (auto + manual box) ----------
+    @property
+    def face(self): return getattr(self, "_face", None)
+
+    @face.setter
+    def face(self, v):
+        self._face = v; self._update_face_label()
+
+    def _update_face_label(self):
+        lb = getattr(self, "face_lbl", None)
+        if lb is None: return
+        if getattr(self, "rgb", None) is None:
+            lb.setText("Face: photo open koro"); lb.setStyleSheet("color:#555;")
+        elif self.face is not None:
+            lb.setText("Face: \u2714 thik ache (detect/set kora)"); lb.setStyleSheet("color:#2e7d32;font-weight:bold;")
+        else:
+            lb.setText("Face: \u2718 paini - 'Face Manual' diye box ankon koro"); lb.setStyleSheet("color:#c62828;font-weight:bold;")
+
+    def redetect_face(self, silent=False):
+        """Ekhon er photo te abar face khoje. Pele self.face set kore True dey."""
+        if self.rgb is None: return False
+        f = None
+        try:
+            src = self.orig if self.orig is not None else self.rgb
+            f = detect_face(np.array(src))
+            if f is None and src is not self.rgb: f = detect_face(np.array(self.rgb))
+        except Exception:
+            f = None
+        if f is not None:
+            self.face = f; self.hair_mask = None
+            if hasattr(self, "_invalidate_cache"): self._invalidate_cache()
+            return True
+        return False
+
+    def m_face_detect(self):
+        if not self.need_img(): return
+        self.busy("Face khujchi...")
+        if self.redetect_face():
+            self.status.setText("Face detect holo. Ekhon skin / pimple / hair tool use korte paro. (thik na hole 'Face Manual')")
+        else:
+            self.open_face_picker("Auto face paini. Mukh er upor drag kore box ankon koro, tarpor Enter chapo.")
+
+    def m_face_manual(self):
+        self.open_face_picker()
+
+    def open_face_picker(self, msg=None):
+        if not self.need_img(): return
+        if self.stack.currentIndex() in (1, 2):
+            self.status.setText("Age Crop / Retouch Studio theke Enter chepe ber ho, tarpor Face Manual chapo."); return
+        self.face_view.set_image(np.array(self.rgb), self.face)
+        self.stack.setCurrentIndex(3)
+        self.status.setText(msg or "Mukh er upor drag kore box ankon koro (kone tene thik koro). Enter = OK, Esc = Cancel")
+
+    def close_face_picker(self, commit=True):
+        if self.stack.currentIndex() != 3: return
+        box = self.face_view.get_box() if commit else None
+        self.stack.setCurrentIndex(0)
+        self.show_img(self.photo if self.photo is not None else self.composite())
+        retry, self._pending_face_action = self._pending_face_action, None
+        if not commit:
+            self.status.setText("Face select cancel"); return
+        if box is None:
+            self.status.setText("Box khub chhoto ba ankon hoyni. Abar 'Face Manual' chapo."); return
+        self.face = tuple(int(v) for v in box); self.hair_mask = None
+        if hasattr(self, "_invalidate_cache"): self._invalidate_cache()
+        self.status.setText("Face set holo. Ekhon skin / pimple / hair tool kaj korbe.")
+        if retry: QTimer.singleShot(0, retry)           # je button chepechile seta nijei cholbe
+
+    def _need_face(self, retry=None):
+        """Face thakle True. Na thakle: age abar auto khuje; tao na pele manual box picker khole
+        (Enter chapar por 'retry' tool ta nijei cholbe)."""
         if not self.need_img(): return False
-        if self.face is None:
-            QMessageBox.information(self, "Face paini", "Skin effect er jonno face detect lagbe. Shoja-shuji mukh wala photo nao."); return False
-        return True
+        if self.face is not None: return True
+        if self.redetect_face(): return True
+        self._pending_face_action = retry
+        self.open_face_picker("Auto face paini. Mukh er upor drag kore box ankon koro, tarpor Enter chapo.")
+        return False
 
     def m_smooth(self):
-        if not self._need_face(): return
+        if not self._need_face(self.m_smooth): return
         self.push(); a = np.array(self.rgb)
         self.rgb = Image.fromarray(skin_smooth(a, skin_mask(a, self.face), self.face, self.s_smooth.value()))
         self.after_change(); self.status.setText("Skin smooth holo")
 
     def m_tone(self):
-        if not self._need_face(): return
+        if not self._need_face(self.m_tone): return
         self.push(); a = np.array(self.rgb)
         self.rgb = Image.fromarray(skin_tone_up(a, skin_mask(a, self.face), self.s_tone.value()))
         self.after_change(); self.status.setText("Skin tone up holo")
@@ -1149,19 +1368,19 @@ class App(QWidget):
 
     # ---------- NEW: AI / RETOUCH / STUDIO ----------
     def m_retouch(self):
-        if not self._need_face(): return
+        if not self._need_face(self.m_retouch): return
         self.push(); a = np.array(self.rgb)
         self.rgb = Image.fromarray(skin_retouch(a, skin_mask(a, self.face), self.face, self.s_smooth.value()))
         self.after_change(); self.status.setText("Skin Retouch holo (natural)")
 
     def m_shine(self):
-        if not self._need_face(): return
+        if not self._need_face(self.m_shine): return
         self.push(); a = np.array(self.rgb)
         self.rgb = Image.fromarray(skin_shine_fix(a, skin_mask(a, self.face), 70))
         self.after_change(); self.status.setText("Oily shine kombano holo")
 
     def m_pimple(self):
-        if not self._need_face(): return
+        if not self._need_face(self.m_pimple): return
         self.busy("Pimple/dag khujchi...")
         self.push(); a = np.array(self.rgb)
         out, n = remove_blemishes(a, self.face, self.s_pimple.value())
@@ -1218,7 +1437,7 @@ class App(QWidget):
     def m_hair(self, color=None):
         if not self.need_img(): return
         if self.hair_mask is None or self.hair_mask.shape != (self.rgb.height, self.rgb.width):
-            if not self._need_face(): return
+            if not self._need_face(lambda: self.m_hair(color)): return
             self.hair_detect()
         if (self.hair_mask > 0.5).sum() < 200:
             QMessageBox.information(self, "Chul paini", "Chuler jaiga auto dhora jayni. 'Area Edit (brush)' diye lal brush e chul ankon koro, tarpor abar Apply koro.")
@@ -1325,6 +1544,8 @@ class App(QWidget):
         add(m, "Reset Original", self.reset_orig); add(m, "Original / Result dekho", self.toggle)
         m = mb.addMenu("&AI Tools")
         add(m, "AUTO CHALAO (shob feature ekshathe)", self.run_auto, "F5")
+        add(m, "Face Auto Detect", self.m_face_detect, "F7")
+        add(m, "Face Manual (box ankon)", self.m_face_manual, "F8")
         m.addSeparator()
         add(m, "Photo Enhance PRO", self.m_enhance)
         add(m, "AI Face Restore (GFPGAN)", self.m_face_ai)
@@ -1449,6 +1670,7 @@ class App(QWidget):
     def on_enter(self, *_):
         i = self.stack.currentIndex()
         if i == 2: self.close_retouch()
+        elif i == 3: self.close_face_picker()
         elif i == 1:
             pre = self._pre
             if pre is not None and pre["box"] != self.box:       # crop undo er jonno
@@ -1458,6 +1680,7 @@ class App(QWidget):
     def on_esc(self, *_):
         i = self.stack.currentIndex()
         if i == 2: self.close_retouch(commit=False); return
+        if i == 3: self.close_face_picker(commit=False); return
         if i == 1:
             pre = self._pre
             if pre is not None and pre["box"] is not None and self.box is not None:
@@ -1880,7 +2103,7 @@ class AppV2(App):
         self.face = detect_face(np.array(im))
         self.box = None; self.photo_base = self.photo = self.sheet = None
         self._invalidate_cache(); self.show_img(im)
-        self.status.setText("Photo loaded. " + ("Face detect holo." if self.face else "Face paini."))
+        self.status.setText("Photo loaded. " + ("Face detect holo." if self.face else "Face paini. Skin/Pimple/Hair er jonno 'Face Manual' diye box ankon koro."))
 
     def _cached_skin_mask(self):
         key = ("skin", self._v2_revision, self.face)
@@ -1903,35 +2126,28 @@ class AppV2(App):
             self._submit("enhance", {"arr": np.array(self.rgb), "strength": self.s_enh.value()},
                          "Photo Enhance PRO...", history=True)
 
-    def _need_face(self):
-        if not self.need_img(): return False
-        if self.face is None:
-            QMessageBox.information(self, "Face paini", "Skin effect er jonno face detect lagbe.")
-            return False
-        return True
-
     def m_smooth(self):
-        if self._need_face():
+        if self._need_face(self.m_smooth):
             self._submit("smooth", {"arr": np.array(self.rgb), "face": self.face, "strength": self.s_smooth.value()},
                          "Skin smooth...", history=True)
 
     def m_tone(self):
-        if self._need_face():
+        if self._need_face(self.m_tone):
             self._submit("tone", {"arr": np.array(self.rgb), "face": self.face, "strength": self.s_tone.value()},
                          "Skin tone...", history=True)
 
     def m_retouch(self):
-        if self._need_face():
+        if self._need_face(self.m_retouch):
             self._submit("retouch", {"arr": np.array(self.rgb), "face": self.face, "strength": self.s_smooth.value()},
                          "Skin retouch...", history=True)
 
     def m_shine(self):
-        if self._need_face():
+        if self._need_face(self.m_shine):
             self._submit("shine", {"arr": np.array(self.rgb), "face": self.face, "strength": 70},
                          "Oily shine fix...", history=True)
 
     def m_pimple(self):
-        if self._need_face():
+        if self._need_face(self.m_pimple):
             self._submit("pimple", {"arr": np.array(self.rgb), "face": self.face, "strength": self.s_pimple.value()},
                          "Pimple/dag khujchi...", history=True)
 
@@ -1947,7 +2163,7 @@ class AppV2(App):
         self._submit("upscale", {"image": self.rgb.copy()}, "AI Upscale 2x...", history=True)
 
     def hair_detect(self):
-        if not self._need_face(): return False
+        if not self._need_face(self.m_hair): return False
         if self.hair_mask is not None and self.hair_mask.shape == (self.rgb.height, self.rgb.width):
             return True
         return self._submit("hairmask", {
@@ -1993,6 +2209,7 @@ class AppV2(App):
         if self._job_active:
             self.status.setText("Ekta processing already cholche."); return
         self.alpha = None
+        if self.face is None: self.redetect_face()
         settings = {
             "enh": self.c_enh.isChecked(), "enh_strength": self.s_enh.value(),
             "face_ai": self.c_face.isChecked(), "face_strength": self.s_aiface.value(),
