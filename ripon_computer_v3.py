@@ -1,6 +1,6 @@
 # =====================================================================
 #  RIPON COMPUTER  -  AI PHOTO STUDIO   (v3)
-#  One-click AI passport photo, print studio, document studio,
+#  AI photo studio, print studio, document studio,
 #  customer jobs, shop accounts.  Built on top of Ripon Computer v2.
 #
 #  Run:      python ripon_computer_v3.py
@@ -14,7 +14,7 @@
 #  Dress/Suit PNG: put transparent PNGs in the "dress" folder next to this file.
 #                  Sub-folders Shirt / Suit / Tie / Coat become tabs automatically.
 # =====================================================================
-import sys, os, math, io, re, json, time, glob, shutil, sqlite3, queue, threading, datetime, traceback, urllib.request
+import sys, os, math, io, re, json, time, glob, shutil, sqlite3, queue, threading, datetime, traceback, urllib.request, subprocess
 import numpy as np
 import cv2
 from PIL import Image, ImageOps, ImageDraw, ImageEnhance, ImageFont, ImageFilter
@@ -32,11 +32,13 @@ APP_DIR = _app_dir()
 MODELS_DIR = os.path.join(APP_DIR, "models")
 JOBS_DIR = os.path.join(APP_DIR, "jobs")
 RECOVERY_DIR = os.path.join(APP_DIR, "recovery")
+EXTERNAL_DIR = os.path.join(APP_DIR, "external_edit")      # files handed to Photoshop / GIMP... (the customer original is never touched)
 DB_PATH = os.path.join(APP_DIR, "shop.db")
 SETTINGS_PATH = os.path.join(APP_DIR, "settings.json")
+WORKFLOW_SETTINGS_PATH = os.path.join(APP_DIR, "workflow_settings.json")
 PRESETS_PATH = os.path.join(APP_DIR, "presets.json")
 LOG_PATH = os.path.join(APP_DIR, "ripon.log")
-for _d in (MODELS_DIR, JOBS_DIR, RECOVERY_DIR):
+for _d in (MODELS_DIR, JOBS_DIR, RECOVERY_DIR, EXTERNAL_DIR):
     os.makedirs(_d, exist_ok=True)
 
 # All AI libraries must store their weights under MODELS_DIR (set BEFORE they are imported).
@@ -54,10 +56,10 @@ from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, 
                                QGroupBox, QScrollArea, QStackedWidget, QColorDialog, QMenuBar, QLineEdit,
                                QProgressBar, QFrame, QTabWidget, QDialog, QTableWidget, QTableWidgetItem,
                                QHeaderView, QListWidget, QListWidgetItem, QAbstractItemView, QFormLayout,
-                               QDialogButtonBox, QInputDialog, QSizePolicy, QGridLayout, QTextEdit, QSplitter)
+                               QDialogButtonBox, QInputDialog, QSizePolicy, QGridLayout, QTextEdit, QSplitter, QMenu)
 from PySide6.QtGui import (QPixmap, QImage, QPainter, QPen, QColor, QPainterPath, QPolygonF, QIcon,
-                           QShortcut, QKeySequence, QAction, QFont, QPageSize, QPageLayout)
-from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, QObject, Signal, Slot, QTimer, QSize, QMarginsF
+                           QShortcut, QKeySequence, QAction, QFont, QPageSize, QPageLayout, QBrush, QCursor)
+from PySide6.QtCore import Qt, QRectF, QPointF, QSizeF, QObject, Signal, Slot, QTimer, QSize, QMarginsF, QRect
 from PySide6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.argv[0] if getattr(sys, "frozen", False) else __file__))
@@ -110,15 +112,17 @@ def paper_px(name, custom_mm=None, dpi=None):
     return mm2px(mm[0], dpi), mm2px(mm[1], dpi)
 
 # A preset describes EVERYTHING the operator normally picks by hand.
-#   head  = chin-to-crown height as a fraction of photo height
+#   head  = chin-to-crown height as a fraction of photo height (the TIGHTEST framing allowed).
+#           When shoulders are detected the crop may open up to head_min (default head-0.08) so shoulders + shirt fit.
 #   top   = gap above the crown as a fraction of photo height
+#   (the space under the chin = 1 - head - top; it must be >= ~0.5 head-heights to show neck + shoulders + shirt)
 BUILTIN_PRESETS = {
     "🇧🇩 Bangladesh Passport": dict(w=35, h=45, dpi=300, bg=[255, 255, 255], copies=6, paper="4R (4x6 inch)",
-                                   head=0.74, top=0.09, enhance=50, retouch=40, builtin=True, service="Passport Photo"),
+                                   head=0.62, top=0.08, enhance=50, retouch=40, builtin=True, service="Passport Photo"),
     "Visa Photo":              dict(w=40, h=50, dpi=300, bg=[255, 255, 255], copies=4, paper="4R (4x6 inch)",
-                                   head=0.72, top=0.09, enhance=50, retouch=40, builtin=True, service="Visa Photo"),
+                                   head=0.62, top=0.08, enhance=50, retouch=40, builtin=True, service="Visa Photo"),
     "NID Photo":               dict(w=35, h=45, dpi=300, bg=[255, 255, 255], copies=4, paper="4R (4x6 inch)",
-                                   head=0.72, top=0.10, enhance=45, retouch=35, builtin=True, service="NID/ID Photo"),
+                                   head=0.60, top=0.09, enhance=45, retouch=35, builtin=True, service="NID/ID Photo"),
     "Job Application Photo":   dict(w=35, h=45, dpi=300, bg=[173, 216, 230], copies=4, paper="A4 (210x297 mm)",
                                    head=0.66, top=0.10, enhance=55, retouch=45, builtin=True, service="Passport Photo"),
     "CV Photo":                dict(w=40, h=50, dpi=300, bg=[173, 216, 230], copies=2, paper="A4 (210x297 mm)",
@@ -684,16 +688,59 @@ def head_geometry(fi, alpha=None):
     cx_l = (0.0 + mouth_l[0] + chin_l[0]) / 3.0
     return dict(origin=E, angle=ang, chin_ly=eye_to_chin, crown_ly=crown_ly, head_h=head_h, cx_l=cx_l, real_crown=crown_pt is not None)
 
-def ideal_box(fi, preset, alpha=None, level=True):
-    """Professional passport crop -> [cx, cy, box_height, angle] (v2 crop box format)."""
+def head_bounds(preset):
+    """(lowest, highest) allowed head height as a fraction of the photo. highest = preset 'head' (tightest crop)."""
+    hi = float(preset.get("head", 0.62))
+    lo = float(preset.get("head_min", max(0.40, hi - 0.08)))
+    return min(lo, hi), hi
+
+def shoulder_depth(alpha, fi, g):
+    """Where the shoulder line starts, measured from the chin DOWN in head-heights (head frame, so tilt is handled).
+    Needs the person mask. None when it cannot be found reliably (caller then uses the safe preset framing)."""
+    if alpha is None or fi is None: return None
+    try:
+        sy = shoulder_row(alpha, fi)
+        if sy is None: return None
+        _, ly = _local((fi["chin"][0], sy), g["origin"], g["angle"])
+        d = (ly - g["chin_ly"]) / max(g["head_h"], 1.0)
+        return float(d) if 0.05 <= d <= 1.2 else None       # outside this range = long hair / mask error -> ignore
+    except Exception:
+        return None
+
+def ideal_box(fi, preset, alpha=None, level=True, img_size=None):
+    """Professional head-and-shoulders passport crop -> [cx, cy, box_height, angle] (v2 crop box format).
+    The head size is kept inside the preset range (head_min .. head). With a person mask the box opens downwards just enough to
+    show the neck, both shoulders and the top of the shirt; without it the preset 'head' ratio is used (safe fallback).
+    img_size=(W, H): the box is not allowed to run below the photo when the head-size range gives room to avoid it."""
     g = head_geometry(fi, alpha)
-    head, top = float(preset.get("head", 0.74)), float(preset.get("top", 0.09))
-    bh = g["head_h"] / head
-    top_ly = g["crown_ly"] - top * bh
-    cx, cy = _to_img(g["cx_l"], top_ly + bh / 2.0, g["origin"], g["angle"])
+    top = float(preset.get("top", 0.08))
+    lo, hi = head_bounds(preset)
+    H = g["head_h"]
+    bh_min, bh_max = H / hi, H / lo                          # tightest / widest crop height
+    bh = bh_min
+    sd = shoulder_depth(alpha, fi, g)
+    if sd is not None:
+        want = sd + float(preset.get("shoulder_margin", 0.18))     # shoulders + a little shirt, in head-heights under the chin
+        bh = min(bh_max, max(bh_min, H * (1.0 + want) / (1.0 - top)))
     ang = g["angle"] if level else 0.0
-    if not level:                                            # keep the same on-screen framing without rotating
-        cx, cy = _to_img(g["cx_l"], top_ly + bh / 2.0, g["origin"], 0.0)
+    ratio = float(preset.get("w", 35)) / float(preset.get("h", 45))
+    def make(b):
+        top_ly = g["crown_ly"] - top * b
+        return _to_img(g["cx_l"], top_ly + b / 2.0, g["origin"], ang if not level else g["angle"])
+    if img_size:                                             # shrink (towards the tightest crop) if the photo ends too early
+        for _ in range(12):
+            cx, cy = make(bh); t = math.radians(ang)
+            low = max(cy + sy_ * (bh / 2.0) * math.cos(t) + sx_ * (bh * ratio / 2.0) * math.sin(t) for sx_, sy_ in ((-1, 1), (1, 1)))
+            if low <= img_size[1] + 1 or bh <= bh_min * 1.0001: break
+            bh = max(bh_min, bh * 0.97)
+    cx, cy = make(bh)
+    if img_size:                                             # photo still too short: slide the box up (never above a small crown gap) so no blank band is left
+        t = math.radians(ang); ct = max(math.cos(t), 0.5)
+        low = max(cy + sy_ * (bh / 2.0) * math.cos(t) + sx_ * (bh * ratio / 2.0) * math.sin(t) for sx_, sy_ in ((-1, 1), (1, 1)))
+        over = low - img_size[1]
+        if over > 1:
+            shift = min(over / ct, max(0.0, (top - 0.02) * bh))
+            cx, cy = cx + shift * math.sin(t), cy - shift * math.cos(t)
     return [float(cx), float(cy), float(bh), float(ang)]
 
 def crop_metrics(fi, box, ratio, alpha=None):
@@ -714,12 +761,13 @@ def passport_check(fi, box, ratio, preset, alpha=None):
     if fi is None:
         return [("bad", "noface", "⚠ Face not found - use Face Manual")]
     m = crop_metrics(fi, box, ratio, alpha)
-    head, top = float(preset.get("head", 0.74)), float(preset.get("top", 0.09))
+    top = float(preset.get("top", 0.08)); lo, hi = head_bounds(preset)
     items = []
-    tol_h = 0.08
-    if m["head_frac"] > head + tol_h: items.append(("warn", "framing", "⚠ Head too large"))
-    elif m["head_frac"] < head - tol_h - 0.04: items.append(("warn", "framing", "⚠ Head too small"))
-    eye_target = top + head * 0.46
+    if m["head_frac"] > hi + 0.06: items.append(("warn", "framing", "⚠ Head too large"))
+    elif m["head_frac"] < lo - 0.04: items.append(("warn", "framing", "⚠ Head too small"))
+    eye_target = top + m["head_frac"] * 0.46
+    below = (1.0 - m["chin_v"]) / max(m["head_frac"], 0.05)          # space under the chin, in head-heights
+    if m["chin_v"] <= 1.0 and below < 0.30: items.append(("warn", "framing", "⚠ Shoulders / shirt not visible enough"))
     if m["eye_v"] > eye_target + 0.07: items.append(("warn", "framing", "⚠ Face too low"))
     elif m["eye_v"] < eye_target - 0.07: items.append(("warn", "framing", "⚠ Face too high"))
     if m["u_center"] > 0.5 + 0.045: items.append(("warn", "framing", "⚠ Face too far right"))
@@ -965,38 +1013,35 @@ def skin_shine_fix(rgb, mask, strength):
     return np.clip(rgb.astype(np.float32) * (1 - mask) + conv * mask, 0, 255).astype(np.uint8)
 
 def heal_spot(arr, cx, cy, r):
-    """Spot Healing: pashe er porishkar skin theke patch niye dag dhake (arr inplace bodlay).
-    return (x0, y0, old_patch) undo er jonno, na hole None"""
+    """Small, local spot-healing using OpenCV Telea inpainting.
+    Only the clicked spot is changed; surrounding skin texture is preserved.
+    Returns (x0, y0, old_patch) for undo."""
     H, W = arr.shape[:2]
-    r = int(max(3, r)); pad = int(r * 1.5) + 1; S = 2 * pad
+    r = int(max(3, min(60, r)))
+    pad = int(r * 1.6) + 2
+    S = 2 * pad + 1
     cx, cy = int(round(cx)), int(round(cy))
-    def grab(px, py):
-        x0, y0 = int(round(px)) - pad, int(round(py)) - pad
-        if x0 < 0 or y0 < 0 or x0 + S > W or y0 + S > H: return None
-        return x0, y0
-    t = grab(cx, cy)
-    if t is None: return None
-    x0, y0 = t
-    tgt = arr[y0:y0 + S, x0:x0 + S]
+    x0, y0 = cx - pad, cy - pad
+    if x0 < 0 or y0 < 0 or x0 + S > W or y0 + S > H:
+        return None
+
+    roi = arr[y0:y0 + S, x0:x0 + S]
+    old = roi.copy()
+
     yy, xx = np.mgrid[0:S, 0:S]
-    dist = np.hypot(xx - pad + 0.5, yy - pad + 0.5)
-    ring = (dist > r * 1.1) & (dist < r * 1.5)
-    inner = dist < r
-    ref = tgt[ring].astype(np.float32).mean(0)
-    best, best_sc = None, 1e18
-    for ang in range(0, 360, 30):
-        for mult in (2.6, 3.6):
-            g = grab(cx + math.cos(math.radians(ang)) * r * mult, cy + math.sin(math.radians(ang)) * r * mult)
-            if g is None: continue
-            p = arr[g[1]:g[1] + S, g[0]:g[0] + S]
-            sc = np.abs(p[ring].astype(np.float32).mean(0) - ref).sum() + 0.6 * p[inner].astype(np.float32).std(0).sum()
-            if sc < best_sc: best, best_sc = p, sc
-    if best is None: return None
-    src = best.astype(np.float32)
-    src += ref - src[ring].mean(0)                       # tone match
-    m = np.clip((r - dist) / (0.45 * r), 0, 1)[..., None]
-    old = tgt.copy()
-    arr[y0:y0 + S, x0:x0 + S] = np.clip(tgt.astype(np.float32) * (1 - m) + src * m, 0, 255).astype(np.uint8)
+    dist = np.hypot(xx - pad, yy - pad)
+    mask = (dist <= r).astype(np.uint8) * 255
+
+    # Telea works only on the small marked area, so it cannot smooth the whole face.
+    fixed = cv2.inpaint(np.ascontiguousarray(roi), mask, max(1.0, r * 0.45), cv2.INPAINT_TELEA)
+
+    # Feather the result at the boundary to avoid a visible circular patch.
+    feather = np.clip((r + 2.0 - dist) / max(2.0, r * 0.30), 0.0, 1.0)
+    feather *= (dist <= r + 2.0)
+    feather = cv2.GaussianBlur(feather.astype(np.float32), (0, 0), max(0.8, r * 0.10))[..., None]
+
+    out = roi.astype(np.float32) * (1.0 - feather) + fixed.astype(np.float32) * feather
+    arr[y0:y0 + S, x0:x0 + S] = np.clip(out, 0, 255).astype(np.uint8)
     return x0, y0, old
 
 def find_blemishes(rgb, face, sens):
@@ -1524,8 +1569,8 @@ def run_ai_pipeline(img, preset, opts, ctx, hub=None):
        ctx.step(i, n, text) reports REAL progress (completed steps), ctx.check() raises Cancelled.
        Returns dict(rgb, alpha, fi, face, box, photo_base, notes, timings)."""
     hub = hub or HUB; notes = []; tm = {}
-    STEPS = ["Detecting face...", "Aligning face...", "Removing background...", "Refining hair...",
-             "Enhancing face...", "Retouching skin...", "Creating passport crop..."]
+    STEPS = ["Detecting face...", "Aligning face...", "Removing background...", "Preparing background mask...",
+             "Enhancing face...", "Retouching skin...", "Creating photo crop..."]
     N = len(STEPS)
     def stage(i):
         ctx.check(); ctx.step(i, N, STEPS[i]); tm[STEPS[i]] = time.time()
@@ -1540,9 +1585,9 @@ def run_ai_pipeline(img, preset, opts, ctx, hub=None):
     if fi.get("src") == "haar" and fi.get("est"): notes.append(("info", "Eyes estimated (basic face detector). Install InsightFace for exact alignment."))
     # ---- 2. align + region of interest ----
     stage(1)
-    box0 = ideal_box(fi, preset, None)
+    box0 = ideal_box(fi, preset, None, img_size=(rgb0.shape[1], rgb0.shape[0]))
     if abs(fi["angle"]) > 25: notes.append(("warn", "Head is strongly tilted - check the result"))
-    x0, y0, x1, y1 = _roi_for(fi, box0, rgb0.shape[:2])
+    x0, y0, x1, y1 = _roi_for(fi, box0, rgb0.shape[:2], margin=1.75)
     arr = np.ascontiguousarray(rgb0[y0:y1, x0:x1]); fi = _scale_fi(fi, 1.0, -x0, -y0)
     # ---- 3. background ----
     alpha = None; used_model = None
@@ -1561,15 +1606,12 @@ def run_ai_pipeline(img, preset, opts, ctx, hub=None):
                 log.warning("segment %s failed: %s", mdl, e)
                 notes.append(("warn", "Background model '%s' failed: %s" % (mdl, (str(e).splitlines() or [""])[0][:80])))
         if alpha is None: notes.append(("warn", "Background could not be removed - original background kept. Continue manually."))
-    # ---- 4. hair edges ----
+    # ---- 4. background mask: V2-style direct rembg alpha ----
+    # IMPORTANT: do NOT run refine_alpha(), guided filtering, erosion, Gaussian blur,
+    # or decontaminate() here. Those extra edge operations were causing the V3
+    # hair/edge blur and unwanted soft borders.
     stage(3)
-    if alpha is not None:
-        face_pt = ((fi["le"][0] + fi["re"][0]) / 2.0, (fi["le"][1] + fi["re"][1]) / 2.0 + 0.2 * fi["bbox"][3])
-        alpha = refine_alpha(arr, alpha, opts.get("edge", 60), face_pt)
-        arr = decontaminate(arr, alpha)
-        if alpha[int(np.clip(face_pt[1], 0, alpha.shape[0] - 1)), int(np.clip(face_pt[0], 0, alpha.shape[1] - 1))] < 0.5:
-            notes.append(("warn", "Background removal may have cut the face - check the result"))
-    # real head top / shoulders from the mask, then the final framing
+    # real head top / shoulders from the ORIGINAL segmentation mask, then final framing
     g = head_geometry(fi, alpha); fi["crown"] = _to_img(g["cx_l"], g["crown_ly"], g["origin"], g["angle"])
     # ---- 5. enhance face ----
     stage(4)
@@ -1612,18 +1654,19 @@ def run_ai_pipeline(img, preset, opts, ctx, hub=None):
     if opts.get("retouch", True) and face_t is not None:
         lvl = int(preset.get("retouch", 40))
         try:
-            arr, npim = remove_blemishes(arr, face_t, 50)
+            # Keep one-click retouch conservative: no automatic pimple detector.
+            # Automatic spot detection can mistake pores, freckles and facial texture
+            # for blemishes. Use Retouch Studio for individual spots.
             m = feature_guard(skin_mask(arr, face_t), fi)
             arr = skin_shine_fix(arr, m, 45)
             arr = skin_retouch(arr, m, face_t, lvl)
-            if npim: notes.append(("info", "%d spot(s) cleaned" % npim))
         except Cancelled: raise
         except Exception as e:
             notes.append(("warn", "Skin retouch skipped: %s" % (str(e).splitlines() or [""])[0][:60])); log.exception("retouch")
     # ---- 7. passport crop ----
     stage(6)
     g = head_geometry(fi, alpha); fi["crown"] = _to_img(g["cx_l"], g["crown_ly"], g["origin"], g["angle"])
-    box = ideal_box(fi, preset, alpha)
+    box = ideal_box(fi, preset, alpha, img_size=(arr.shape[1], arr.shape[0]))
     rgb_img = Image.fromarray(arr)
     alpha_img = Image.fromarray((np.clip(alpha, 0, 1) * 255).astype(np.uint8)) if alpha is not None else None
     src = rgb_img.convert("RGBA")
@@ -2050,27 +2093,297 @@ class CropView(QWidget):
         self.box[2] *= 0.95 if e.angleDelta().y() > 0 else 1.05
         self._notify()
 
-class PaintView(QWidget):
-    """Retouch Studio: click diye pimple heal, chuler jaiga brush. Scroll = zoom, right/middle drag = sorano"""
+class ZoomView(QWidget):
+    """Shared zoom / move engine (main preview + Retouch / Background Repair view).
+    Zoom 10% - 3000%  (100% = one image pixel per screen pixel). Wheel = zoom around the cursor,
+    right / middle drag (or Space + left drag) = move. Only the VIEW changes - pixels are never touched."""
+    ZMIN, ZMAX = 0.10, 30.0
+    view_changed = Signal()
+
     def __init__(self):
         super().__init__()
-        self.setMinimumSize(560, 650); self.setMouseTracking(True)
-        self.pm = None; self.iw = self.ih = 1
-        self.ov = None; self.tool = "heal"; self.radius = 12; self.on_action = None
-        self.zoom = 1.0; self.pan = QPointF(0, 0); self.dirty_hair = False
-        self._paint = False; self._panning = False; self._last = None; self._lastimg = None; self._cur = None
+        self.setMouseTracking(True); self.setFocusPolicy(Qt.StrongFocus)
+        self.iw = self.ih = 1
+        self._fit = True; self._scale = 1.0; self.pan = QPointF(0, 0)
+        self._panning = False; self._space = False; self._plast = None; self._base_cursor = Qt.ArrowCursor
+
+    def has_image(self): return False
+
+    # ---- geometry ----
+    def fit_scale(self):
+        return min(max(1, self.width()) / float(max(1, self.iw)), max(1, self.height()) / float(max(1, self.ih)))
+
+    def cur_scale(self): return self.fit_scale() if self._fit else self._scale
+
+    def _geom(self):
+        s = self.cur_scale()
+        return s, (self.width() - self.iw * s) / 2 + self.pan.x(), (self.height() - self.ih * s) / 2 + self.pan.y()
+
+    def _w2i(self, pt):
+        s, ox, oy = self._geom(); return (pt.x() - ox) / s, (pt.y() - oy) / s
+
+    def _clamp_pan(self):
+        s = self.cur_scale(); m = 80
+        mx = (self.width() + self.iw * s) / 2 - m; my = (self.height() + self.ih * s) / 2 - m
+        self.pan = QPointF(max(-mx, min(mx, self.pan.x())), max(-my, min(my, self.pan.y())))
+
+    def _changed(self):
+        self.update(); self.view_changed.emit()
+
+    # ---- zoom commands ----
+    def zoom_to(self, new_scale, anchor=None):
+        if not self.has_image(): return
+        s0, ox, oy = self._geom()
+        if anchor is None: anchor = QPointF(self.width() / 2.0, self.height() / 2.0)
+        ix, iy = (anchor.x() - ox) / s0, (anchor.y() - oy) / s0
+        self._scale = max(min(self.ZMIN, self.fit_scale()), min(self.ZMAX, new_scale)); self._fit = False
+        s, ox2, oy2 = self._geom()
+        self.pan = QPointF(self.pan.x() + anchor.x() - (ox2 + ix * s), self.pan.y() + anchor.y() - (oy2 + iy * s))
+        self._clamp_pan(); self._changed()
+
+    def zoom_step(self, direction, anchor=None):
+        self.zoom_to(self.cur_scale() * (1.25 if direction > 0 else 0.8), anchor)
+
+    def actual_size(self): self.zoom_to(1.0)
+
+    def fit_view(self):
+        self._fit = True; self.pan = QPointF(0, 0); self._changed()
+
+    def reset_view(self): self.fit_view()
+
+    # ---- drawing helper: only the visible part of the image is drawn (fast at any zoom) ----
+    def _draw_layer(self, p, src, s, ox, oy, clip):
+        x0 = max(0, int(math.floor((clip.left() - ox) / s)) - 1); y0 = max(0, int(math.floor((clip.top() - oy) / s)) - 1)
+        x1 = min(self.iw, int(math.ceil((clip.right() + 1 - ox) / s)) + 1); y1 = min(self.ih, int(math.ceil((clip.bottom() + 1 - oy) / s)) + 1)
+        if x1 <= x0 or y1 <= y0: return
+        sr = QRectF(x0, y0, x1 - x0, y1 - y0); dr = QRectF(ox + x0 * s, oy + y0 * s, (x1 - x0) * s, (y1 - y0) * s)
+        p.setRenderHint(QPainter.SmoothPixmapTransform, s < 2.0 and (x1 - x0) * (y1 - y0) < 2.5e6)
+        if isinstance(src, QImage): p.drawImage(dr, src, sr)
+        else: p.drawPixmap(dr, src, sr)
+
+    # ---- events ----
+    def resizeEvent(self, e):
+        super().resizeEvent(e); self.view_changed.emit()
+
+    def enterEvent(self, e):
+        fw = QApplication.focusWidget()
+        if not isinstance(fw, (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit)): self.setFocus()
+        super().enterEvent(e)
+
+    def wheelEvent(self, e):
+        if not self.has_image(): return
+        steps = e.angleDelta().y() / 120.0
+        if steps: self.zoom_to(self.cur_scale() * (1.25 ** steps), e.position())
+        e.accept()
+
+    def _pan_press(self, e):
+        if not self.has_image(): return False
+        if e.button() in (Qt.RightButton, Qt.MiddleButton) or (e.button() == Qt.LeftButton and self._space):
+            self._panning = True; self._plast = e.position(); self.setCursor(Qt.ClosedHandCursor); return True
+        return False
+
+    def _pan_move(self, e):
+        if not self._panning: return False
+        d = e.position() - self._plast; self._plast = e.position()
+        if self._fit: self._scale = self.cur_scale(); self._fit = False
+        self.pan = QPointF(self.pan.x() + d.x(), self.pan.y() + d.y()); self._clamp_pan(); self._changed(); return True
+
+    def _pan_release(self, e):
+        if self._panning:
+            self._panning = False; self.setCursor(Qt.OpenHandCursor if self._space else self._base_cursor)
+
+    def mousePressEvent(self, e): self._pan_press(e)
+    def mouseMoveEvent(self, e): self._pan_move(e)
+    def mouseReleaseEvent(self, e): self._pan_release(e)
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Space and not e.isAutoRepeat():
+            self._space = True; self.setCursor(Qt.OpenHandCursor); e.accept(); return
+        super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e):
+        if e.key() == Qt.Key_Space and not e.isAutoRepeat():
+            self._space = False
+            if not self._panning: self.setCursor(self._base_cursor)
+            e.accept(); return
+        super().keyReleaseEvent(e)
+
+    def focusOutEvent(self, e):
+        self._space = False
+        if not self._panning: self.setCursor(self._base_cursor)
+        super().focusOutEvent(e)
+
+class PreviewView(ZoomView):
+    """The big main preview (Photo / Print Sheet / Original). Zoom and move change only the view.
+    The view of every image size is remembered, so Original <-> Edited keeps your zoom on each."""
+    peek = Signal(bool)                       # hold the backslash key = temporary Original
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(560, 600); self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.pm = None; self._states = {}; self._peeking = False
+
+    def has_image(self): return self.pm is not None
+
+    def set_image(self, pm, size):
+        if self.pm is not None: self._states[(self.iw, self.ih)] = (self._fit, self._scale, QPointF(self.pan))
+        self.pm = pm; self.iw, self.ih = size
+        st = self._states.get(tuple(size))
+        if st: self._fit, self._scale, self.pan = st[0], st[1], QPointF(st[2])
+        else: self._fit = True; self._scale = 1.0; self.pan = QPointF(0, 0)
+        self._changed()
+
+    def forget_views(self):
+        self._states.clear(); self._fit = True; self.pan = QPointF(0, 0); self._changed()
+
+    def paintEvent(self, e):
+        p = QPainter(self); clip = e.rect(); p.fillRect(clip, QColor("#e9eef2"))
+        if self.pm is None:
+            p.setPen(QColor("#667")); f = p.font(); f.setPointSize(16); p.setFont(f)
+            p.drawText(QRectF(self.rect()), Qt.AlignCenter, "Open a photo to begin"); p.end(); return
+        s, ox, oy = self._geom()
+        self._draw_layer(p, self.pm, s, ox, oy, clip)
+        p.setPen(QPen(QColor("#888"), 1)); p.setBrush(Qt.NoBrush); p.drawRect(QRectF(ox, oy, self.iw * s, self.ih * s)); p.end()
+
+    def keyPressEvent(self, e):
+        if e.key() == Qt.Key_Backslash and not e.isAutoRepeat():
+            self._peeking = True; self.peek.emit(True); e.accept(); return
+        super().keyPressEvent(e)
+
+    def keyReleaseEvent(self, e):
+        if e.key() == Qt.Key_Backslash and not e.isAutoRepeat():
+            self._end_peek(); e.accept(); return
+        super().keyReleaseEvent(e)
+
+    def focusOutEvent(self, e):
+        self._end_peek(); super().focusOutEvent(e)
+
+    def _end_peek(self):
+        if self._peeking: self._peeking = False; self.peek.emit(False)
+
+class AlphaRepair:
+    """Editable alpha mask for Background Repair. ONLY the alpha is changed - the original RGB pixels are never touched:
+       Restore raises alpha (the ORIGINAL pixels come back), Eraser lowers it. No blur / feather / refinement is applied.
+       Brush strokes work at full resolution but only the small rectangle under the brush is recomputed.
+       The red / blue tint and the faint 'ghost' of removed areas exist only in the display buffer (never saved)."""
+    GHOST = 77                                              # removed areas stay 30% visible so missing parts can be found
+    TINT = {1: ((255, 0, 0), 0.42), 2: ((0, 150, 255), 0.35)}   # 1 = restored (red), 2 = erased (blue)
+    T = 128; MAX_UNDO_BYTES = 120 * 1024 * 1024; MAX_UNDO = 200
+
+    def __init__(self, rgb, alpha):
+        self.rgb = rgb                                       # H,W,3 uint8 (read only)
+        self.alpha = np.ascontiguousarray(alpha, np.uint8).copy()
+        h, w = self.alpha.shape
+        self.ov = np.zeros((h, w), np.uint8)                 # 0 none, 1 restored, 2 erased  (display only)
+        self.disp = np.zeros((h, w, 4), np.uint8)            # premultiplied RGBA shown on screen
+        self.qimage = QImage(self.disp.data, w, h, 4 * w, QImage.Format_RGBA8888_Premultiplied)
+        self.undo = []; self._undo_bytes = 0; self._tiles = {}; self.n_strokes = 0
+        for y in range(0, h, 256): self._refresh(0, y, w, min(h, y + 256))
+
+    def _refresh(self, x0, y0, x1, y1):
+        a = self.alpha[y0:y1, x0:x1].astype(np.uint16); rgb = self.rgb[y0:y1, x0:x1].astype(np.uint16); o = self.ov[y0:y1, x0:x1]
+        da = self.GHOST + a * (255 - self.GHOST) // 255        # alpha 0 -> ghost, alpha 255 -> solid
+        for code, (col, t) in self.TINT.items():
+            m = o == code
+            if m.any(): rgb[m] = (rgb[m] * (1.0 - t) + np.array(col, np.float32) * t).astype(np.uint16)
+        da = np.where(o == 2, np.maximum(da, 150), da)         # erased strokes stay visible as a blue guide
+        out = self.disp[y0:y1, x0:x1]
+        out[..., :3] = (rgb * da[..., None] // 255).astype(np.uint8); out[..., 3] = da.astype(np.uint8)
+
+    def begin_stroke(self): self._tiles = {}
+
+    def _save_tiles(self, x0, y0, x1, y1):
+        T = self.T
+        for ty in range(y0 // T, (y1 - 1) // T + 1):
+            for tx in range(x0 // T, (x1 - 1) // T + 1):
+                if (ty, tx) not in self._tiles:
+                    ys, xs = ty * T, tx * T
+                    self._tiles[(ty, tx)] = (self.alpha[ys:ys + T, xs:xs + T].copy(), self.ov[ys:ys + T, xs:xs + T].copy())
+
+    def stroke(self, p1, p2, radius, restore):
+        h, w = self.alpha.shape; r = max(1.0, float(radius))
+        x0 = int(max(0, math.floor(min(p1[0], p2[0]) - r - 2))); x1 = int(min(w, math.ceil(max(p1[0], p2[0]) + r + 2)))
+        y0 = int(max(0, math.floor(min(p1[1], p2[1]) - r - 2))); y1 = int(min(h, math.ceil(max(p1[1], p2[1]) + r + 2)))
+        if x1 <= x0 or y1 <= y0: return None
+        self._save_tiles(x0, y0, x1, y1)
+        cov = np.zeros((y1 - y0, x1 - x0), np.uint8)
+        a = (int(round(p1[0] - x0)), int(round(p1[1] - y0))); b = (int(round(p2[0] - x0)), int(round(p2[1] - y0)))
+        cv2.line(cov, a, b, 255, max(1, int(round(2 * r))), cv2.LINE_AA)
+        for c in (a, b): cv2.circle(cov, c, max(1, int(round(r))), 255, -1, cv2.LINE_AA)
+        c16 = cov.astype(np.uint16); sub = self.alpha[y0:y1, x0:x1]; s16 = sub.astype(np.uint16)
+        sub[...] = (s16 + (255 - s16) * c16 // 255) if restore else (s16 - s16 * c16 // 255)
+        self.ov[y0:y1, x0:x1][c16 >= 128] = 1 if restore else 2
+        self._refresh(x0, y0, x1, y1)
+        return (x0, y0, x1, y1)
+
+    def end_stroke(self):
+        if not self._tiles: return
+        size = sum(a.nbytes + o.nbytes for a, o in self._tiles.values())
+        self.undo.append((self._tiles, size)); self._undo_bytes += size; self._tiles = {}; self.n_strokes += 1
+        while len(self.undo) > self.MAX_UNDO or (self._undo_bytes > self.MAX_UNDO_BYTES and len(self.undo) > 1):
+            self._undo_bytes -= self.undo.pop(0)[1]
+
+    def undo_stroke(self):
+        if not self.undo: return False
+        tiles, size = self.undo.pop(); self._undo_bytes -= size; self.n_strokes = max(0, self.n_strokes - 1); T = self.T
+        for (ty, tx), (a, o) in tiles.items():
+            ys, xs = ty * T, tx * T; h, w = a.shape
+            self.alpha[ys:ys + h, xs:xs + w] = a; self.ov[ys:ys + h, xs:xs + w] = o; self._refresh(xs, ys, xs + w, ys + h)
+        return True
+
+class PaintView(ZoomView):
+    """Retouch Studio + Background Repair brush. Scroll = zoom, right/middle drag (or Space+drag) = move."""
+    _CHK = None
+    def __init__(self):
+        super().__init__()
+        self.setMinimumSize(560, 650)
+        self.pm = None; self.ov = None; self.rep = None; self.tool = "heal"; self.radius = 12; self.on_action = None
+        self.dirty_hair = False; self._paint = False; self._lastimg = None; self._cur = None
+
+    def has_image(self): return self.pm is not None or self.rep is not None
 
     def set_image(self, arr, keep_view=False):
         arr = np.ascontiguousarray(arr); h, w = arr.shape[:2]
         self.pm = QPixmap.fromImage(QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888))
         self.iw, self.ih = w, h
-        if not keep_view: self.zoom = 1.0; self.pan = QPointF(0, 0)
+        if not keep_view: self.fit_view()
         self.update()
 
     def refresh(self, arr): self.set_image(arr, True)
 
-    def clear(self): self.pm = None; self.ov = None; self.update()
+    def clear(self): self.pm = None; self.ov = None; self.rep = None; self._paint = False; self.update()
 
+    # ---- Background Repair ----
+    def begin_repair(self, rgb, alpha, tool):
+        self.rep = AlphaRepair(rgb, alpha); self.iw, self.ih = rgb.shape[1], rgb.shape[0]
+        self.pm = None; self.ov = None; self.tool = tool; self._paint = False
+        self._base_cursor = Qt.CrossCursor; self.setCursor(self._base_cursor); self.fit_view()
+
+    def end_repair(self):
+        rep, self.rep = self.rep, None; self._paint = False; self._base_cursor = Qt.ArrowCursor; self.setCursor(self._base_cursor); self.update(); return rep
+
+    def repair_undo(self):
+        ok = self.rep is not None and self.rep.undo_stroke()
+        if ok: self.update()
+        return ok
+
+    @classmethod
+    def _checker(cls):
+        if cls._CHK is None:
+            pm = QPixmap(16, 16); pm.fill(QColor(255, 255, 255)); q = QPainter(pm)
+            q.fillRect(0, 0, 8, 8, QColor(204, 204, 204)); q.fillRect(8, 8, 8, 8, QColor(204, 204, 204)); q.end(); cls._CHK = QBrush(pm)
+        return cls._CHK
+
+    def _dab(self, p1, p2):
+        box = self.rep.stroke(p1, p2, self.radius, self.tool == "bg_restore")
+        if box:
+            s, ox, oy = self._geom()
+            self.update(QRect(int(ox + box[0] * s) - 2, int(oy + box[1] * s) - 2, int((box[2] - box[0]) * s) + 5, int((box[3] - box[1]) * s) + 5))
+
+    def _ring_rect(self, pt):
+        r = self.radius * self.cur_scale() + 4
+        return QRect(int(pt.x() - r), int(pt.y() - r), int(2 * r) + 1, int(2 * r) + 1)
+
+    # ---- hair overlay (Retouch Studio) ----
     def set_overlay(self, mask):
         if mask is None: self.ov = None; self.update(); return
         h, w = mask.shape
@@ -2087,13 +2400,6 @@ class PaintView(QWidget):
         a = buf.reshape(q.height(), q.bytesPerLine())[:, :q.width() * 4].reshape(q.height(), q.width(), 4)[..., 3]
         return np.clip(a.astype(np.float32) / 120.0, 0, 1)
 
-    def _geom(self):
-        s = min(self.width() / self.iw, self.height() / self.ih) * self.zoom
-        return s, (self.width() - self.iw * s) / 2 + self.pan.x(), (self.height() - self.ih * s) / 2 + self.pan.y()
-
-    def _w2i(self, pt):
-        s, ox, oy = self._geom(); return (pt.x() - ox) / s, (pt.y() - oy) / s
-
     def _stroke(self, p1, p2, erase):
         if self.ov is None:
             self.ov = QImage(self.iw, self.ih, QImage.Format_ARGB32_Premultiplied); self.ov.fill(0)
@@ -2105,52 +2411,58 @@ class PaintView(QWidget):
         self.dirty_hair = True
 
     def paintEvent(self, e):
-        p = QPainter(self); p.fillRect(self.rect(), QColor("#cfcfcf"))
-        if self.pm is None:
+        p = QPainter(self); clip = e.rect(); p.fillRect(clip, QColor("#cfcfcf"))
+        if self.rep is None and self.pm is None:
             p.end(); return
-        s, ox, oy = self._geom(); target = QRectF(ox, oy, self.iw * s, self.ih * s)
-        p.setRenderHint(QPainter.SmoothPixmapTransform, s < 1)
-        p.drawPixmap(target, self.pm, QRectF(self.pm.rect()))
-        if self.ov is not None and self.tool.startswith("hair"): p.drawImage(target, self.ov)
+        s, ox, oy = self._geom()
+        if self.rep is not None:
+            vis = QRectF(ox, oy, self.iw * s, self.ih * s).intersected(QRectF(clip))
+            if not vis.isEmpty():
+                p.fillRect(vis, self._checker()); self._draw_layer(p, self.rep.qimage, s, ox, oy, clip)
+        else:
+            self._draw_layer(p, self.pm, s, ox, oy, clip)
+            if self.ov is not None and self.tool.startswith("hair"): self._draw_layer(p, self.ov, s, ox, oy, clip)
         if self._cur is not None:
-            r = self.radius * s; p.setBrush(Qt.NoBrush)
+            r = self.radius * s; p.setBrush(Qt.NoBrush); p.setRenderHint(QPainter.Antialiasing, True)
+            ring = {"bg_restore": QColor(255, 40, 40), "bg_erase": QColor(0, 160, 255)}.get(self.tool) if self.rep is not None else None
             p.setPen(QPen(QColor(255, 255, 255), 2)); p.drawEllipse(self._cur, r, r)
-            p.setPen(QPen(QColor(0, 0, 0), 1, Qt.DashLine)); p.drawEllipse(self._cur, r, r)
+            p.setPen(QPen(ring or QColor(0, 0, 0), 1, Qt.DashLine)); p.drawEllipse(self._cur, r, r)
         p.end()
 
     def mousePressEvent(self, e):
-        if e.button() in (Qt.RightButton, Qt.MiddleButton):
-            self._panning = True; self._last = e.position(); return
-        if e.button() == Qt.LeftButton and self.pm is not None:
-            ix, iy = self._w2i(e.position())
-            if not (0 <= ix < self.iw and 0 <= iy < self.ih): return
-            if self.tool == "heal":
-                if self.on_action: self.on_action("heal", ix, iy)
-            else:
-                self._paint = True; self._lastimg = (ix, iy)
-                self._stroke((ix, iy), (ix, iy), self.tool == "hair_erase"); self.update()
+        if self._pan_press(e): return
+        if e.button() != Qt.LeftButton: return
+        if self.rep is not None:
+            ix, iy = self._w2i(e.position()); self._paint = True; self._lastimg = (ix, iy)
+            self.rep.begin_stroke(); self._dab((ix, iy), (ix, iy)); return
+        if self.pm is None: return
+        ix, iy = self._w2i(e.position())
+        if not (0 <= ix < self.iw and 0 <= iy < self.ih): return
+        if self.tool == "heal":
+            if self.on_action: self.on_action("heal", ix, iy)
+        else:
+            self._paint = True; self._lastimg = (ix, iy)
+            self._stroke((ix, iy), (ix, iy), self.tool == "hair_erase"); self.update()
 
     def mouseMoveEvent(self, e):
-        self._cur = e.position()
-        if self._panning:
-            d = e.position() - self._last; self._last = e.position()
-            self.pan = QPointF(self.pan.x() + d.x(), self.pan.y() + d.y())
-        elif self._paint:
+        old = self._cur; self._cur = e.position()
+        if self._pan_move(e): return
+        if self._paint:
             ix, iy = self._w2i(e.position())
-            self._stroke(self._lastimg, (ix, iy), self.tool == "hair_erase"); self._lastimg = (ix, iy)
-        self.update()
+            if self.rep is not None: self._dab(self._lastimg, (ix, iy))
+            else: self._stroke(self._lastimg, (ix, iy), self.tool == "hair_erase")
+            self._lastimg = (ix, iy)
+        if self.rep is None: self.update(); return
+        if old is not None: self.update(self._ring_rect(old))
+        self.update(self._ring_rect(self._cur))
 
-    def mouseReleaseEvent(self, e): self._panning = False; self._paint = False
+    def mouseReleaseEvent(self, e):
+        self._pan_release(e)
+        if self._paint and e.button() == Qt.LeftButton:
+            self._paint = False
+            if self.rep is not None: self.rep.end_stroke()
 
     def leaveEvent(self, e): self._cur = None; self.update()
-
-    def wheelEvent(self, e):
-        if self.pm is None: return
-        pt = e.position(); ix, iy = self._w2i(pt)
-        self.zoom = max(0.2, min(30.0, self.zoom * (1.25 if e.angleDelta().y() > 0 else 0.8)))
-        s, ox, oy = self._geom()
-        self.pan = QPointF(self.pan.x() + pt.x() - (ox + ix * s), self.pan.y() + pt.y() - (oy + iy * s))
-        self.update()
 
 class FacePickView(QWidget):
     """Manual face box: mouse drag = notun box, box er bhitore drag = sorano, kone tene = boro/chhoto.
@@ -2254,8 +2566,7 @@ def run_auto_pipeline(arr, face, settings, model_name, hair_rgb):
     skin_on = settings.get("smooth") or settings.get("tone") or settings.get("shine")
     if face is not None:
         mask = skin_mask(arr, face) if skin_on else None
-        if settings.get("pimple"):
-            arr, _ = remove_blemishes(arr, face, settings.get("pimple_strength", 55))
+        # No automatic pimple/spot detector in V3. It can damage natural skin texture.
         if settings.get("shine"):
             if mask is None: mask = skin_mask(arr, face)
             arr = skin_shine_fix(arr, mask, 60)
@@ -2265,16 +2576,17 @@ def run_auto_pipeline(arr, face, settings, model_name, hair_rgb):
         if settings.get("tone"):
             if mask is None: mask = skin_mask(arr, face)
             arr = skin_tone_up(arr, mask, settings.get("tone_strength", 50))
-    elif skin_on or settings.get("pimple"):
-        notes.append("Face not found, skin/pimple skipped")
+    elif skin_on:
+        notes.append("Face not found, skin retouch skipped")
     person = None
     if settings.get("bg") or settings.get("hair"):
         try:
+            # V2-style direct segmentation mask. No hair-edge refinement or blur.
             person = remove_bg(Image.fromarray(arr), model_name).getchannel("A")
         except Exception as e:
             if settings.get("bg"):
                 raise
-            notes.append("Hair segmentation skip: " + (str(e).splitlines() or [""])[0][:90])
+            notes.append("Background segmentation skip: " + (str(e).splitlines() or [""])[0][:90])
     hair_mask = None
     if settings.get("hair"):
         if face is None:
@@ -2780,26 +3092,23 @@ class CoreMixin:
 
     # ---------- cache / dirty ----------
     def _invalidate_cache(self):
-        self._rev += 1; self._cache.clear(); self._last_display_key = None; self._last_display_pixmap = None
+        self._rev += 1; self._cache.clear(); self._pm_cache = []
 
     def set_rgb(self, arr_or_img):
         self.rgb = arr_or_img if isinstance(arr_or_img, Image.Image) else Image.fromarray(np.ascontiguousarray(arr_or_img))
         self._invalidate_cache()
 
     # ---------- preview ----------
-    def _display_size(self):
-        return min(self.PREVIEW_MAX, max(320, self.preview.width() - 12)), min(self.PREVIEW_MAX, max(320, self.preview.height() - 12))
-
     def show_img(self, im):
+        """the big preview shows the FULL image; zoom / move are pure view transforms (no resizing, no recompression)"""
         if im is None: return
         self.stack.setCurrentIndex(0)
-        mw, mh = self._display_size(); key = (id(im), im.size, mw, mh)
-        if key == self._last_display_key and self._last_display_pixmap is not None:
-            self.preview.setPixmap(self._last_display_pixmap); return
-        view = im
-        if im.width > mw or im.height > mh:
-            view = im.copy(); view.thumbnail((mw, mh), Image.Resampling.LANCZOS)
-        pm = pil_to_pixmap(view); self._last_display_key = key; self._last_display_pixmap = pm; self.preview.setPixmap(pm)
+        key = (id(im), im.size)
+        for k, _im, pm in self._pm_cache:
+            if k == key: self.preview.set_image(pm, im.size); return
+        pm = pil_to_pixmap(im)
+        self._pm_cache = (self._pm_cache + [(key, im, pm)])[-3:]       # keeps a strong ref to im, so id() can never be reused
+        self.preview.set_image(pm, im.size)
 
     def show_current(self):
         """what the big preview shows: Photo / Print Sheet / Original"""
@@ -2839,7 +3148,7 @@ class CoreMixin:
         else: self.after_change()
 
     def undo(self):
-        if self.stack.currentIndex() == 2: return self.rt_undo()
+        if self.stack.currentIndex() == 2: return self.repair_undo() if self.repair_active else self.rt_undo()
         if not self.history: return
         self.redo_stack.append(self._snap()); self._restore(self.history.pop()); self.status_msg("Undo")
 
@@ -2849,6 +3158,7 @@ class CoreMixin:
 
     def reset_orig(self):
         if not self.need_img(): return
+        self.close_bg_repair(False)
         self.push(); self.rgb = self.orig; self.alpha = None; self.fi_orig = self.fi_orig
         self.finfo = self.fi_orig; self.face = fi_face_tuple(self.finfo); self.hair_mask = None; self.box = None
         self.photo_base = self.photo = None; self.sheets = []
@@ -2857,6 +3167,7 @@ class CoreMixin:
     def after_change(self):
         if self.rgb is None: return
         self._invalidate_cache()
+        if self.repair_active: return                      # the repair view is open; it refreshes everything when it closes
         if self.stack.currentIndex() == 1: self.refresh_preview()
         elif self.photo_base is not None: self.apply_crop()
         else: self.show_img(self.composite())
@@ -2874,6 +3185,7 @@ class CoreMixin:
 
     def open_photo(self, path=None):
         if self.runner.busy: return self.status_msg("Please wait - a job is running.")
+        self.close_bg_repair(False)
         if not path:
             path, _ = QFileDialog.getOpenFileName(self, "Open Photo", SETTINGS.get("last_dir", ""), "Images (*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff)")
         if not path: return
@@ -2884,10 +3196,10 @@ class CoreMixin:
         self.adopt_original(path)
         self.orig = im; self.rgb = im; self.alpha = None; self.history = []; self.redo_stack = []; self.hair_mask = None
         self.finfo = self.fi_orig = None; self.face = None; self.box = None; self.photo_base = self.photo = None; self.sheets = []
-        self.view_mode = "photo"; self._invalidate_cache(); self._update_face_label(); self.set_view("photo")
+        self.view_mode = "photo"; self._invalidate_cache(); self._update_face_label(); self.preview.forget_views(); self.set_view("photo")
         self.update_quality(); self.status_msg("Photo loaded: %s (%dx%d)" % (os.path.basename(path), im.width, im.height))
         self._mark_dirty()
-        if SETTINGS.get("auto_ai") and not self.runner.busy: QTimer.singleShot(50, self.ai_passport)
+        if SETTINGS.get("auto_ai") and not self.runner.busy: QTimer.singleShot(50, lambda: self.detect_face_async(silent=True))
         else: self.detect_face_async(silent=True)
 
     # ---------- face (async) ----------
@@ -2995,7 +3307,7 @@ class CoreMixin:
         self.set_bg_silent(p.get("bg", (255, 255, 255)))
         self.size_lbl.setText("%g x %g mm   %d DPI" % (p["w"], p["h"], p.get("dpi", 300)))
         if self.rgb is not None and self.stack.currentIndex() == 0 and (self.photo_base is not None):
-            if self.finfo is not None and reframe: self.box = ideal_box(self.finfo, self.preset, self.alpha_np()); self.base_h = self.box[2]
+            if self.finfo is not None and reframe: self.box = ideal_box(self.finfo, self.preset, self.alpha_np(), img_size=self.rgb.size); self.base_h = self.box[2]
             self.apply_crop()
         self.update_layout_info(); self._mark_dirty()
 
@@ -3086,6 +3398,7 @@ class CoreMixin:
         j = self.db.get_job(jid)
         if not j: return
         if self.runner.busy: return self.status_msg("Please wait - a job is running.")
+        self.close_bg_repair(False)
         self.e_customer.setText(j["customer"] if j["customer"] != "Walk-in" else ""); self.e_phone.setText(j["phone"] or "")
         self.e_service.setCurrentText(j["service"] or SERVICES[0]); self.e_price.setValue(float(j["price"] or 0)); self.copies.setValue(int(j["copies"] or 1))
         self.job_id = jid; self.job_folder = j.get("folder"); self.job_lbl.setText("Job #%d" % jid)
@@ -3124,7 +3437,7 @@ class CoreMixin:
         self.photo_base = self.photo = None; self.sheets = []; self.view_mode = "photo"; self._invalidate_cache(); self._update_face_label()
         if st.get("cropped") and self.box: self.apply_crop()
         else: self.show_img(self.composite())
-        self.set_view("photo"); self.banner.done("Job #%d opened" % jid)
+        self.preview.forget_views(); self.set_view("photo"); self.banner.done("Job #%d opened" % jid)
 
     def job_export(self, jid):
         j = self.db.get_job(jid)
@@ -3193,6 +3506,8 @@ class CoreMixin:
 class EditMixin:
     def _bg_op(self, label, fn, apply, history=True, cancellable=True):
         """run fn(ctx) off the GUI thread; apply(result) on the GUI thread. Duplicate clicks are ignored."""
+        if self.repair_active:
+            self.status_msg("Finish Background Repair first (Enter = Apply, Esc = Cancel)."); return False
         if self.runner.busy:
             self.status_msg("Please wait - another job is running."); return False
         if history: self.push()
@@ -3221,9 +3536,11 @@ class EditMixin:
                 try: a = HUB.segment(arr, m); break
                 except Exception as e: last = e; a = None
             if a is None: raise RuntimeError(str(last))
-            ctx.msg("Refining hair edges..."); ctx.check()
-            a = refine_alpha(arr, a, edge, face_pt)
-            return decontaminate(arr, a), a
+            # V2 behavior: use rembg alpha directly.
+            # No guided filter, erosion, Gaussian blur, hair refinement or
+            # color decontamination is applied to the segmentation edge.
+            ctx.msg("Background mask ready"); ctx.check()
+            return arr, a
         return fn
 
     def _face_pt(self):
@@ -3240,16 +3557,12 @@ class EditMixin:
         self._bg_op("Removing background...", self._segment_job(arr, model, self.s_edge.value(), self._face_pt()), apply)
 
     def m_bg_restore(self):
-        if self.need_img(): self.push(); self.alpha = None; self.after_change(); self.status_msg("Original background restored")
+        if self.need_img(): self.close_bg_repair(False); self.push(); self.alpha = None; self.after_change(); self.status_msg("Original background restored")
 
     def m_edge_refine(self):
-        if not self.need_img(): return
-        if self.alpha is None: return QMessageBox.information(self, "Hair Edge", "Remove the background first.")
-        arr = np.array(self.rgb); a0 = np.array(self.alpha, np.float32) / 255.0; v = self.s_edge.value(); fp = self._face_pt()
-        def fn(ctx): a = refine_alpha(arr, a0, v, fp); return decontaminate(arr, a), a
-        def apply(res):
-            self.set_rgb(res[0]); self.alpha = Image.fromarray((res[1] * 255).astype(np.uint8)); self._invalidate_cache(); self.after_change(); self.banner.done("Hair edges refined")
-        self._bg_op("Refining hair edges...", fn, apply)
+        # Intentionally disabled in V3. The direct V2-style segmentation mask
+        # is cleaner for this shop workflow than artificial hair-edge refinement.
+        self.status_msg("Hair-edge refinement is disabled. V3 uses the original segmentation edge.")
 
     # ---------- enhance / skin ----------
     def m_enhance(self):
@@ -3275,11 +3588,10 @@ class EditMixin:
     def m_shine(self):   self._skin_op("Reducing oily shine...", lambda a, m, f: skin_shine_fix(a, m, 70), "Oily shine reduced", self.m_shine)
 
     def m_pimple(self):
-        if not self._need_face(self.m_pimple): return
-        arr, face, s = np.array(self.rgb), self.face, self.s_pimple.value()
-        def apply(res):
-            a, n = res; self._done_rgb(a, "%d spot(s) removed. Use Retouch Studio for the rest." % n)
-        self._bg_op("Looking for pimples / spots...", lambda ctx: remove_blemishes(arr, face, s), apply)
+        # Safe replacement for the old auto detector: open click-to-heal.
+        # This avoids removing pores/freckles or changing the whole face.
+        if not self.need_img(): return
+        self.open_retouch("heal")
 
     def m_face_ai(self):
         if not self.need_img(): return
@@ -3348,8 +3660,9 @@ class EditMixin:
     # ---------- Retouch Studio ----------
     def open_retouch(self, tool="heal"):
         if not self.need_img() or self.stack.currentIndex() == 1: return
+        if self.repair_active: return self.status_msg("Finish Background Repair first (Enter = Apply, Esc = Cancel).")
         if self.stack.currentIndex() != 2:
-            self.rt_work = np.ascontiguousarray(np.array(self.rgb)); self.rt_stack = []
+            self.rt_work = np.ascontiguousarray(np.array(self.rgb)); self.rt_stack = []; self.paint_view.radius = self.s_brush.value()
             self.paint_view.set_image(self.rt_work); self.paint_view.dirty_hair = False
             ok = self.hair_mask is not None and self.hair_mask.shape == self.rt_work.shape[:2]
             self.paint_view.set_overlay(self.hair_mask if ok else None); self.stack.setCurrentIndex(2)
@@ -3366,7 +3679,9 @@ class EditMixin:
         self.status_msg("Click on a pimple (brush a little bigger than it). Scroll = zoom, Right-drag = move. Enter = Done, Esc = Cancel"
                         if tool == "heal" else "Red = hair. Brush adds, eraser removes. Enter = Done, then 'Apply Hair Color'")
 
-    def on_brush(self, v): self.paint_view.radius = v; self.paint_view.update()
+    def on_brush(self, v):
+        if self.repair_active: return                       # the Background Repair brush has its own size slider
+        self.paint_view.radius = v; self.paint_view.update()
 
     def on_paint_action(self, kind, x, y):
         if kind != "heal" or self.rt_work is None: return
@@ -3439,7 +3754,7 @@ class EditMixin:
     # ---------- crop editor ----------
     def ensure_box(self):
         if self.box is None:
-            self.box = ideal_box(self.finfo, self.preset, self.alpha_np()) if self.finfo is not None else auto_box(self.rgb, self.face, self.ratio(), True)
+            self.box = ideal_box(self.finfo, self.preset, self.alpha_np(), img_size=self.rgb.size) if self.finfo is not None else auto_box(self.rgb, self.face, self.ratio(), True)
             self.base_h = self.box[2]; self._reset_zoom_tilt()
 
     def _reset_zoom_tilt(self):
@@ -3447,6 +3762,7 @@ class EditMixin:
 
     def open_editor(self):
         if not self.need_img(): return
+        if self.repair_active: return self.status_msg("Finish Background Repair first (Enter = Apply, Esc = Cancel).")
         self.ensure_box(); self._pre = self._snap()
         self.crop_view.set_data(self.rgb.size, self.ratio(), self.box); self.refresh_preview(); self.stack.setCurrentIndex(1)
         self.status_msg("Drag corners to resize, inside = move, outside = rotate, scroll = zoom. Enter = Done, Esc = Cancel")
@@ -3480,7 +3796,7 @@ class EditMixin:
         w = QApplication.focusWidget()
         if isinstance(w, (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit)): return
         i = self.stack.currentIndex()
-        if i == 2: self.close_retouch()
+        if i == 2: self.close_bg_repair() if self.repair_active else self.close_retouch()
         elif i == 3: self.close_face_picker()
         elif i == 1:
             pre = self._pre
@@ -3489,7 +3805,8 @@ class EditMixin:
 
     def on_esc(self, *_):
         i = self.stack.currentIndex()
-        if i == 2: return self.close_retouch(False)
+        if i == 0 and self._full_preview: return self.toggle_full_preview()
+        if i == 2: return self.close_bg_repair(False) if self.repair_active else self.close_retouch(False)
         if i == 3: return self.close_face_picker(False)
         if i == 1:
             pre = self._pre
@@ -3572,7 +3889,7 @@ class OutputMixin:
         self.sheet = self.sheets[0]; return True
 
     def do_layout(self):
-        if self.photo is None: return QMessageBox.information(self, APP_NAME, "Make the photo first (✨ AI PASSPORT PHOTO or Crop).")
+        if self.photo is None: return QMessageBox.information(self, APP_NAME, "Make the photo first (AI Visa/ID Photo or Crop).")
         self.make_sheet(); self.set_view("sheet")
         self.status_msg("%d sheet(s) ready - %s" % (len(self.sheets), self.layout_lbl.text()))
 
@@ -3594,7 +3911,7 @@ class OutputMixin:
             self.chip.setStyleSheet("color:%s;font-weight:bold;font-size:14px;padding:4px;" % ("#b26a00" if worst == "warn" else "#1b7f2a"))
             self.fix_btn.setVisible(worst == "warn"); return
         if self.rgb is None or self.box is None or self.photo_base is None:
-            self.chip.setText("Open a photo, then press ✨ AI PASSPORT PHOTO"); self.chip.setStyleSheet("color:#555;font-size:14px;padding:4px;")
+            self.chip.setText("Open a photo, then choose AI Visa/ID Photo or Crop"); self.chip.setStyleSheet("color:#555;font-size:14px;padding:4px;")
             self.fix_btn.setVisible(False); self.chip.setToolTip(""); return
         rep = self.current_report()
         worst = "bad" if any(r[0] == "bad" for r in rep) else ("warn" if any(r[0] == "warn" for r in rep) else "ok")
@@ -3701,7 +4018,7 @@ class OutputMixin:
 # =====================================================================
 class AIMixin:
     def ai_passport(self, preset_name=None, basic=False):
-        """✨ AI PASSPORT PHOTO: the whole pipeline in one click, in the background"""
+        """Internal AI photo pipeline used by the size-specific workflows."""
         if not self.need_img(): return
         if self.runner.busy: return self.status_msg("Please wait - a job is running.")
         if self.stack.currentIndex() in (1, 2, 3): self.on_esc()
@@ -3741,11 +4058,11 @@ class AIMixin:
     def _ai_failed(self, msg, exc):
         if isinstance(exc, NoFace):
             self.banner.warn("Face not found - draw a box on the face, then it continues")
-            return self.open_face_picker("Face not found automatically. Drag a box over the face, then press Enter - AI Passport will continue.",
+            return self.open_face_picker("Face not found automatically. Drag a box over the face, then press Enter - AI Photo will continue.",
                                          retry=lambda: self.ai_passport())
         if msg == "Cancelled": return self.banner.idle("Cancelled")
-        self.banner.error("AI Passport failed")
-        if ask_yes_no(self, "AI Passport", "The AI step failed:\n\n%s\n\nContinue in BASIC mode (no AI background / face restore)?" % msg[:500]):
+        self.banner.error("AI Photo failed")
+        if ask_yes_no(self, "AI Photo", "The AI step failed:\n\n%s\n\nContinue in BASIC mode (no AI background / face restore)?" % msg[:500]):
             QTimer.singleShot(0, lambda: self.ai_passport(basic=True))
 
     def ai_visa(self): self.ai_passport("Visa Photo")
@@ -3753,6 +4070,7 @@ class AIMixin:
 
     # ---------- one-click fixes for the quality chip ----------
     def auto_fix(self):
+        if self.repair_active: return self.status_msg("Finish Background Repair first (Enter = Apply, Esc = Cancel).")
         if self.photo_base is None: return self.status_msg("Make the photo first.")
         fixes = []
         for lv, code, txt, fix in self.current_report():
@@ -3767,7 +4085,7 @@ class AIMixin:
         f = self._fix_queue.pop(0)
         if f == "framing":
             if self.finfo is not None:
-                self.box = ideal_box(self.finfo, self.preset, self.alpha_np()); self.base_h = self.box[2]; self._reset_zoom_tilt(); self.apply_crop()
+                self.box = ideal_box(self.finfo, self.preset, self.alpha_np(), img_size=self.rgb.size); self.base_h = self.box[2]; self._reset_zoom_tilt(); self.apply_crop()
                 self.status_msg("Face position corrected")
         elif f == "bg": self.m_bg_remove()
         elif f == "upscale": self.m_upscale()
@@ -3785,14 +4103,14 @@ class AIMixin:
         if not self.need_img() or self.runner.busy: return
         if self.face is None: return self.detect_face_async(silent=False, after=self.run_auto)
         settings = {"enh": self.c_enh.isChecked(), "enh_strength": self.s_enh.value(), "face_ai": self.c_face.isChecked(), "face_strength": self.s_aiface.value(),
-                    "pimple": self.c_pimple.isChecked(), "pimple_strength": self.s_pimple.value(), "smooth": self.c_smooth.isChecked(),
+                    "smooth": self.c_smooth.isChecked(),
                     "smooth_strength": self.s_smooth.value(), "tone": self.c_tone.isChecked(), "tone_strength": self.s_tone.value(),
                     "shine": self.c_shine.isChecked(), "bg": self.c_bg.isChecked(), "hair": self.c_hair.isChecked(), "hair_strength": self.s_hair.value()}
         arr = np.array(self.orig if self.orig is not None else self.rgb); face = self.face; model = MODELS[self.model_box.currentText()]; hrgb = self.hair_rgb
         def apply(res):
             a, alpha, hm, notes = res
             self.set_rgb(a); self.alpha = alpha; self.hair_mask = hm
-            self.box = ideal_box(self.finfo, self.preset, self.alpha_np()) if (self.finfo is not None and self.c_crop.isChecked()) else auto_box(self.rgb, self.face, self.ratio(), self.c_crop.isChecked())
+            self.box = ideal_box(self.finfo, self.preset, self.alpha_np(), img_size=self.rgb.size) if (self.finfo is not None and self.c_crop.isChecked()) else auto_box(self.rgb, self.face, self.ratio(), self.c_crop.isChecked())
             self.base_h = self.box[2]; self._reset_zoom_tilt()
             if self.c_manual.isChecked() or (self.face is None and self.c_crop.isChecked()): self.open_editor()
             else: self.apply_crop()
@@ -3839,6 +4157,219 @@ class AIMixin:
 # =====================================================================
 #  MAIN WINDOW: layout (dashboard) + entry point
 # =====================================================================
+# =====================================================================
+#  EXTERNAL EDITORS  (detect installed programs; the edited photo is exported to its own file)
+# =====================================================================
+def _app_paths_lookup(exe):
+    if sys.platform != "win32": return None
+    try: import winreg
+    except Exception: return None
+    for root in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+        try:
+            with winreg.OpenKey(root, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\%s" % exe) as k:
+                v = (winreg.QueryValue(k, None) or "").strip().strip('"')
+                if v and os.path.isfile(v): return v
+        except OSError: pass
+    return None
+
+def _first_exe(patterns, skip=()):
+    hits = set()
+    for pat in patterns: hits.update(h for h in glob.glob(pat) if os.path.isfile(h))
+    hits = [h for h in hits if not any(s in os.path.basename(h).lower() for s in skip)]
+    return sorted(hits, reverse=True)[0] if hits else None          # newest version first
+
+def detect_editors():
+    """{key: (label, exe path)} for the editors that are really installed (nothing is hard-coded as available)"""
+    pf = [p for p in dict.fromkeys(os.environ.get(k) for k in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)")) if p]
+    la = os.environ.get("LOCALAPPDATA", "")
+    def pat(*parts): return [os.path.join(p, *parts) for p in pf] + ([os.path.join(la, "Programs", *parts)] if la else [])
+    found = {}
+    def add(key, label, patterns, which=None, apppath=None, skip=()):
+        path = _first_exe(patterns, skip) or (_app_paths_lookup(apppath) if apppath else None) or (shutil.which(which) if which else None)
+        if path: found[key] = (label, path)
+    add("photoshop", "Adobe Photoshop", pat("Adobe", "Adobe Photoshop*", "Photoshop.exe") + pat("Adobe", "Photoshop*", "Photoshop.exe"), "Photoshop.exe", "Photoshop.exe")
+    add("gimp", "GIMP", pat("GIMP*", "bin", "gimp-*.exe"), "gimp", "gimp.exe", skip=("console",))
+    add("paintnet", "Paint.NET", pat("paint.net", "paintdotnet.exe") + pat("paint.net", "PaintDotNet.exe"), None, "PaintDotNet.exe")
+    add("affinity", "Affinity Photo", pat("Affinity", "Photo*", "Photo.exe") + pat("Affinity", "Affinity Photo*", "Photo.exe") + pat("Affinity", "Affinity", "Affinity.exe"), None, "Photo.exe")
+    return found
+
+def photos_installed():
+    if sys.platform != "win32": return False
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\Local Settings\Software\Microsoft\Windows\CurrentVersion\AppModel\Repository\Packages") as k:
+            i = 0
+            while True:
+                try: name = winreg.EnumKey(k, i)
+                except OSError: return False
+                if name.startswith("Microsoft.Windows.Photos_"): return True
+                i += 1
+    except Exception:
+        return False
+
+# =====================================================================
+#  MAIN WINDOW - Background Repair (restore / eraser brush on the ALPHA mask)
+# =====================================================================
+class RepairMixin:
+    def open_bg_repair(self, tool="bg_restore"):
+        if not self.need_img(): return
+        if self.repair_active: return self.set_repair_tool(tool)
+        if self.runner.busy: return self.status_msg("Please wait - a job is running.")
+        if self.stack.currentIndex() != 0: return self.status_msg("Finish the current tool first (Enter = Apply, Esc = Cancel).")
+        if self.alpha is None or self.alpha.size != self.rgb.size:
+            return QMessageBox.information(self, "Background Repair", "Remove the background first (Remove Background),\nthen use the Repair Brush to fix missing or leftover parts.")
+        pv = self.paint_view; pv.radius = self.s_bgbrush.value() / 2.0
+        pv.begin_repair(np.ascontiguousarray(np.asarray(self.rgb)), np.array(self.alpha), tool)
+        self.repair_active = True; self.stack.setCurrentIndex(2); self._sync_repair_ui(); self._sync_zoom_bar()
+        self.status_msg("Background Repair: paint with the left mouse button.  Scroll = zoom, Right/Middle drag = move, Enter = Apply, Esc = Cancel")
+
+    def set_repair_tool(self, tool):
+        if not self.repair_active: return self.open_bg_repair(tool)
+        self.paint_view.tool = tool; self.paint_view.update(); self._sync_repair_ui()
+        self.status_msg("Red = restore the original photo here" if tool == "bg_restore" else "Eraser: removes unwanted background (blue guide)")
+
+    def on_bg_brush(self, v):
+        self.l_bgbrush.setText("Brush Size: %d px" % v)
+        if self.repair_active: self.paint_view.radius = v / 2.0; self.paint_view.update()
+
+    def repair_undo(self):
+        if not self.paint_view.repair_undo(): self.status_msg("Nothing to undo in this repair")
+
+    def close_bg_repair(self, commit=True):
+        if not self.repair_active: return
+        rep = self.paint_view.end_repair(); self.paint_view.clear()
+        self.repair_active = False; self._sync_repair_ui()
+        changed = bool(commit and rep is not None and rep.n_strokes > 0)
+        self.stack.setCurrentIndex(0)
+        if changed:
+            self.push()                                           # existing Undo can now revert the whole repair
+            self.alpha = Image.fromarray(rep.alpha); self.hair_mask = None      # only the alpha changed, RGB untouched
+            self.after_change(); self._mark_dirty(); msg = "Background repair applied"
+        else:
+            self.show_current(); msg = "Background repair cancelled" if not commit else "Background repair closed (no changes)"
+        self._sync_zoom_bar(); self.status_msg(msg); self.banner.done(msg)
+
+    def _sync_repair_ui(self):
+        a = self.repair_active; t = self.paint_view.tool
+        if hasattr(self, "b_rep_restore"):
+            self.b_rep_restore.setChecked(a and t == "bg_restore"); self.b_rep_erase.setChecked(a and t == "bg_erase")
+            self.b_rep_apply.setEnabled(a); self.b_rep_cancel.setEnabled(a)
+
+# =====================================================================
+#  MAIN WINDOW - Open the CURRENT EDITED photo in Photoshop / GIMP / other software, then re-import
+# =====================================================================
+class ExternalMixin:
+    def show_ext_menu(self):
+        mn = QMenu(self)
+        for key, (label, path) in detect_editors().items():
+            mn.addAction(label).triggered.connect(lambda _=False, p=path, l=label: self.open_external(p, l))
+        for path in SETTINGS.get("external_apps", []):
+            if os.path.isfile(path):
+                name = os.path.splitext(os.path.basename(path))[0]
+                mn.addAction(name).triggered.connect(lambda _=False, p=path, l=name: self.open_external(p, l))
+        if photos_installed(): mn.addAction("Windows Photos").triggered.connect(lambda _=False: self.open_external("photos", "Windows Photos"))
+        mn.addSeparator()
+        mn.addAction("Choose another application...").triggered.connect(lambda _=False: self.choose_external_app())
+        mn.addAction("Open with the Windows default app").triggered.connect(lambda _=False: self.open_external(None, "default app"))
+        mn.addSeparator()
+        keep = mn.addAction("Keep transparency (no background colour)"); keep.setCheckable(True); keep.setChecked(self._ext_keep_alpha)
+        keep.setToolTip("Only when the background was removed and the photo is not cropped yet")
+        keep.toggled.connect(lambda v: setattr(self, "_ext_keep_alpha", bool(v)))
+        mn.addSeparator(); mn.addAction("↻ Re-import Edited Photo").triggered.connect(lambda _=False: self.reimport_external())
+        mn.exec(QCursor.pos())
+
+    def open_in_photoshop(self):
+        ed = detect_editors().get("photoshop")
+        if ed: return self.open_external(ed[1], ed[0])
+        if self.rgb is None: return self.need_img()
+        if ask_yes_no(self, "Photoshop", "Photoshop was not found on this PC.\n\nChoose another application to open the edited photo?"): self.show_ext_menu()
+
+    def choose_external_app(self):
+        p, _ = QFileDialog.getOpenFileName(self, "Choose an application", os.environ.get("ProgramFiles", ""), "Programs (*.exe);;All files (*)")
+        if not p: return
+        SETTINGS["external_apps"] = ([p] + [a for a in SETTINGS.get("external_apps", []) if a != p])[:6]; save_settings()
+        self.open_external(p, os.path.splitext(os.path.basename(p))[0])
+
+    def open_external(self, app, label=""):
+        """app: exe path | 'photos' | None (Windows default). Always exports the CURRENT edited result to its own PNG first."""
+        if not self.need_img(): return
+        if self.repair_active: return self.status_msg("Apply (Enter) or cancel (Esc) the Background Repair first - then it is included.")
+        if self.runner.busy: return self.status_msg("Please wait - a job is running.")
+        photo, rgb, alpha, bg, keep, dpi = self.photo, self.rgb, self.alpha, self.bg_rgb, self._ext_keep_alpha, DPI
+        def fn(ctx):
+            ctx.msg("Saving the current edited photo...")
+            if photo is not None: im, kind = photo, "photo"                       # cropped final photo: bg colour, brightness, caption... all included
+            elif alpha is not None and keep: im = rgb.convert("RGBA"); im.putalpha(alpha); kind = "rgba"      # transparency kept
+            elif alpha is not None: im = Image.new("RGB", rgb.size, bg); im.paste(rgb, (0, 0), alpha); kind = "rgb"
+            else: im, kind = rgb, "rgb"
+            os.makedirs(EXTERNAL_DIR, exist_ok=True)
+            for f in glob.glob(os.path.join(EXTERNAL_DIR, "RiponComputer_Edit_*.png")):        # tidy files older than 14 days
+                try:
+                    if time.time() - os.path.getmtime(f) > 14 * 86400: os.remove(f)
+                except OSError: pass
+            path = unique_path(os.path.join(EXTERNAL_DIR, "RiponComputer_Edit_%s.png" % datetime.datetime.now().strftime("%Y%m%d_%H%M%S")))
+            im.save(path, "PNG", compress_level=3, dpi=(dpi, dpi))
+            return path, kind, os.path.getmtime(path)
+        def apply(res):
+            path, kind, mtime = res; self._ext = dict(path=path, kind=kind, mtime=mtime)
+            if self._launch_external(app, path):
+                self.banner.done("Opened in %s - save there, then press Re-import" % (label or "the editor"))
+        self._bg_op("Preparing the edited photo...", fn, apply, history=False, cancellable=False)
+
+    def _launch_external(self, app, path):
+        try:
+            if app == "photos": 
+                try: os.startfile("ms-photos:viewer?fileName=" + path)
+                except Exception: os.startfile(path)
+            elif app is None:
+                if hasattr(os, "startfile"): os.startfile(path)
+                else: subprocess.Popen(["xdg-open", path])
+            else: subprocess.Popen([app, path], close_fds=True)
+            return True
+        except Exception as e:
+            log.warning("external open failed: %s", e)
+            QMessageBox.warning(self, "Open With", "Could not open the program.\n%s\n\nThe edited photo is saved here:\n%s" % (e, path)); return False
+
+    def reimport_external(self):
+        if not self.need_img(): return
+        if self.repair_active: return self.status_msg("Apply (Enter) or cancel (Esc) the Background Repair first.")
+        if self.runner.busy: return self.status_msg("Please wait - a job is running.")
+        e = self._ext; path = e["path"] if e and os.path.isfile(e["path"]) else None
+        if path and os.path.getmtime(path) <= e["mtime"] + 0.5:
+            m = QMessageBox(self); m.setWindowTitle("Re-import"); m.setIcon(QMessageBox.Question)
+            m.setText("The edited file has not been saved by the other program yet.\n\nSave it there first (Ctrl+S), or import anyway.")
+            go = m.addButton("Import anyway", QMessageBox.AcceptRole); other = m.addButton("Choose another file...", QMessageBox.ActionRole); m.addButton("Cancel", QMessageBox.RejectRole); m.exec()
+            if m.clickedButton() is other: path = None
+            elif m.clickedButton() is not go: return
+        if not path:
+            os.makedirs(EXTERNAL_DIR, exist_ok=True)
+            path, _ = QFileDialog.getOpenFileName(self, "Re-import edited photo", EXTERNAL_DIR, "Images (*.png *.jpg *.jpeg *.tif *.tiff *.bmp *.webp *.psd)")
+            if not path: return
+        kind = e["kind"] if e else "rgb"
+        def fn(ctx):
+            ctx.msg("Reading the edited photo...")
+            im = ImageOps.exif_transpose(Image.open(path)); im.load(); rgba = im.convert("RGBA")
+            if max(rgba.size) > 4096: rgba.thumbnail((4096, 4096), Image.Resampling.LANCZOS)
+            a = rgba.getchannel("A"); return rgba.convert("RGB"), (a if a.getextrema()[0] < 255 else None)
+        def apply(res):
+            rgb, alpha = res; same = rgb.size == self.rgb.size
+            self.push(); self.alpha = alpha; self.set_rgb(rgb); self.hair_mask = None
+            if kind == "photo":              # the exported file was the finished photo: continue from it as a full-frame image
+                self.finfo = None; self.face = None; w, h = rgb.size
+                self.box = [w / 2.0, h / 2.0, min(float(h), w / self.ratio()), 0.0]; self.base_h = self.box[2]; self._reset_zoom_tilt()
+                self.dress = None; self.dress_path = None
+                for wd, v in ((self.s_bright, 0), (self.s_contrast, 0)): wd.blockSignals(True); wd.setValue(v); wd.blockSignals(False)
+                for wd in (self.c_bw, self.c_date): wd.blockSignals(True); wd.setChecked(False); wd.blockSignals(False)
+                self.cap_edit.blockSignals(True); self.cap_edit.clear(); self.cap_edit.blockSignals(False)
+                self.photo_base = self.photo = None; self.sheets = []; self._invalidate_cache(); self.apply_crop()
+                self.banner.done("Edited photo imported (dress, caption, brightness and B&W were already inside it)")
+            else:
+                if not same: self.finfo = None; self.face = None; self.box = None; self.photo_base = self.photo = None; self.sheets = []
+                self._invalidate_cache(); self.after_change(); self.banner.done("Edited photo imported - continue working here")
+            if not same or kind == "photo": QTimer.singleShot(60, lambda: self.detect_face_async(silent=True, banner=False))
+            self.update_quality()
+        self._bg_op("Importing the edited photo...", fn, apply, history=False, cancellable=False)
+
 APP_STYLE = """
 QWidget{font-size:13px;}
 QPushButton{padding:5px 10px;border:1px solid #b9c3cc;border-radius:6px;background:#f4f7fa;}
@@ -3862,7 +4393,7 @@ def _lbl(text, wrap=True, style=""):
     if style: l.setStyleSheet(style)
     return l
 
-class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
+class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMixin, QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(APP_TITLE); self.resize(1420, 920)
@@ -3872,7 +4403,8 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
         self.dress = None; self.dress_path = None; self._pre = None; self.rt_work = None; self.rt_stack = []
         self.box = None; self.base_h = 1.0; self.bg_rgb = (255, 255, 255)
         self.photo_base = self.photo = self.sheet = None; self.sheets = []; self.view_mode = "photo"
-        self._rev = 0; self._cache = {}; self._last_display_key = None; self._last_display_pixmap = None
+        self._rev = 0; self._cache = {}; self._pm_cache = []
+        self.repair_active = False; self._full_preview = False; self._ext = None; self._ext_keep_alpha = True
         self._fix_queue = []; self._dirty = False; self._saved_rev = 0; self._pending_face_action = None; self._report = []
         self.job_id = None; self.job_folder = None; self.src_path = self.inbox_path = None; self._last_saved_dir = None
         self.doc_studio = None; self._dress_cache = {}
@@ -3889,6 +4421,41 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
         self.fill_preset_box(); self.apply_preset(self.preset_name, reframe=False); self.refresh_dress_tab(); self._update_face_label(); self.update_quality()
         for key in (Qt.Key_Return, Qt.Key_Enter): QShortcut(QKeySequence(key), self).activated.connect(self.on_enter)
         QShortcut(QKeySequence(Qt.Key_Escape), self).activated.connect(self.on_esc)
+        for key, d in ((Qt.Key_Plus, 1), (Qt.Key_Equal, 1), (Qt.Key_Minus, -1)): QShortcut(QKeySequence(key), self).activated.connect(lambda d=d: self._kb_zoom(d))
+        QShortcut(QKeySequence("Ctrl+0"), self).activated.connect(lambda: self.zoom_cmd("fit"))
+        QShortcut(QKeySequence("Ctrl+1"), self).activated.connect(lambda: self.zoom_cmd("100"))
+        QShortcut(QKeySequence(Qt.Key_F11), self).activated.connect(self.toggle_full_preview)
+
+    # ---------- main preview zoom bar ----------
+    def _zoom_target(self):
+        i = self.stack.currentIndex()
+        return self.preview if i == 0 else (self.paint_view if i == 2 else None)
+
+    def zoom_cmd(self, kind):
+        v = self._zoom_target()
+        if v is None or not v.has_image(): return
+        {"out": lambda: v.zoom_step(-1), "in": lambda: v.zoom_step(1), "100": v.actual_size, "fit": v.fit_view, "reset": v.reset_view}[kind]()
+
+    def _kb_zoom(self, d):
+        if isinstance(QApplication.focusWidget(), (QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox, QTextEdit)): return
+        self.zoom_cmd("in" if d > 0 else "out")
+
+    def _sync_zoom_bar(self, *_):
+        v = self._zoom_target(); ok = v is not None and v.has_image()
+        for b in (self.b_zout, self.b_zin, self.b_zpct, self.b_zfit, self.b_zreset): b.setEnabled(ok)
+        self.b_zpct.setText("%d%%" % round(v.cur_scale() * 100) if ok else "-")
+
+    def toggle_full_preview(self):
+        self._full_preview = not self._full_preview; on = self._full_preview
+        self.tabs.setVisible(not on); self.top_bar.setVisible(not on)
+        self.b_zfull.setText("⛶ Exit Full Preview" if on else "⛶ Full Preview")
+        self.status_msg("Full preview - press Esc or F11 to go back" if on else "")
+
+    def _peek_original(self, on):
+        """hold the backslash key = temporary Original; nothing is changed"""
+        if self.stack.currentIndex() != 0 or self.orig is None: return
+        if on: self.show_img(self.orig)
+        else: self.show_current()
 
     def _on_progress(self, text, i, n):
         if n < 0: self.banner.set_fraction(i / float(-n), text)
@@ -3897,8 +4464,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
     # ================= widgets =================
     def build_widgets(self):
         self.banner = ProcessingBanner(); self.banner.cancel_clicked.connect(self.runner.cancel)
-        self.preview = QLabel("Open a photo to begin"); self.preview.setAlignment(Qt.AlignCenter); self.preview.setMinimumSize(560, 600)
-        self.preview.setStyleSheet("border:1px solid #888; background:#e9eef2; color:#667;font-size:18px;"); self.preview.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.preview = PreviewView(); self.preview.peek.connect(self._peek_original)
         self.crop_view = CropView(); self.crop_view.changed = self.on_box_changed; self.crop_view.on_confirm = self.on_enter
         self.paint_view = PaintView(); self.paint_view.on_action = self.on_paint_action; self.face_view = FacePickView()
         self.stack = QStackedWidget()
@@ -3908,7 +4474,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
         self.fix_btn = btn("⚡ AUTO FIX", self.fix_clicked, BTN_ORANGE, "Fix face position, background, brightness automatically", 34); self.fix_btn.setVisible(False)
         self.notes_lbl = QLabel(""); self.notes_lbl.setWordWrap(True); self.notes_lbl.setTextFormat(Qt.RichText); self.notes_lbl.setStyleSheet("color:#8a5a00;")
         self.view_btns = {}
-        for k, t in (("photo", "Photo"), ("sheet", "Print Sheet"), ("orig", "Original")):
+        for k, t in (("orig", "Original"), ("photo", "Edited"), ("sheet", "Print Sheet")):
             b = QPushButton(t); b.setCheckable(True); b.setMinimumHeight(30); b.clicked.connect(lambda _=False, m=k: self.set_view(m)); self.view_btns[k] = b
         self.view_btns["photo"].setChecked(True)
         # header
@@ -3930,19 +4496,19 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
             c = QCheckBox(t); c.setChecked(on)
             if tip: c.setToolTip(tip)
             return c
-        self.c_ai_bg = chk("Remove background"); self.c_ai_enh = chk("Clean and enhance photo"); self.c_ai_skin = chk("Natural skin retouch + remove spots")
+        self.c_ai_bg = chk("Remove background"); self.c_ai_enh = chk("Clean and enhance photo"); self.c_ai_skin = chk("Natural skin retouch (no auto pimple removal)")
         self.c_ai_restore = chk("AI Face Restore - only when the face is blurry"); self.c_ai_up = chk("Upscale - only when the photo is small")
-        self.c_auto_open = chk("Run AI Passport automatically after opening a photo", bool(SETTINGS.get("auto_ai", False)))
+        self.c_auto_open = chk("Auto-detect face after opening a photo", bool(SETTINGS.get("auto_ai", False)))
         self.c_auto_open.toggled.connect(lambda v: (SETTINGS.__setitem__("auto_ai", bool(v)), save_settings()))
         self.s_edge = hslider(0, 100, 60)
         # legacy auto checklist (v2)
         self.c_crop = chk("Auto Crop (follow face)"); self.c_manual = chk("Adjust crop by hand after auto", False); self.c_bg = chk("Auto Background Remove")
         self.c_enh = chk("Auto Enhance"); self.c_smooth = chk("Auto Skin Retouch (natural)"); self.c_tone = chk("Auto Skin Tone Up", False)
-        self.c_pimple = chk("Auto Pimple/Spot Remove"); self.c_shine = chk("Reduce oily shine", False); self.c_face = chk("AI Face Restore (GFPGAN)", False)
-        self.c_hair = chk("Auto Hair Color (select color in Photo Edit)", False)
+        self.c_shine = chk("Reduce oily shine", False); self.c_face = chk("AI Face Restore (GFPGAN)", False)
+        self.c_hair = chk("Auto Hair Color (uses segmentation mask)", False)
         # sliders
-        self.s_smooth = hslider(0, 100, 50); self.s_tone = hslider(0, 100, 50); self.s_enh = hslider(0, 100, 60); self.s_pimple = hslider(0, 100, 55)
-        self.s_aiface = hslider(10, 100, 50); self.s_hair = hslider(20, 100, 100)
+        self.s_smooth = hslider(0, 100, 50); self.s_tone = hslider(0, 100, 50); self.s_enh = hslider(0, 100, 60)
+        self.s_aiface = hslider(10, 100, 35); self.s_hair = hslider(20, 100, 100)
         self.s_zoom = hslider(40, 300, 100); self.s_zoom.valueChanged.connect(self.on_zoom)
         self.s_tilt = hslider(-450, 450, 0); self.s_tilt.valueChanged.connect(self.on_tilt)
         self.s_bright = hslider(-50, 50, 0); self.s_bright.valueChanged.connect(self.apply_adjust)
@@ -3976,17 +4542,115 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
         self.dress_list = QListWidget(); self.dress_list.setViewMode(QListWidget.IconMode); self.dress_list.setIconSize(QSize(84, 84)); self.dress_list.setResizeMode(QListWidget.Adjust)
         self.dress_list.setMovement(QListWidget.Static); self.dress_list.setMinimumHeight(190); self.dress_list.itemDoubleClicked.connect(lambda it: self.load_dress(it.data(Qt.UserRole)))
         self.open_folder_btn = btn("📁 Open folder", self.open_output_folder, "", "Show saved files", 40); self.open_folder_btn.setVisible(False)
+        # main preview zoom bar + Background Repair brush size
+        self.b_zout = btn("−", lambda: self.zoom_cmd("out"), "", "Zoom out  (-  or mouse wheel down)", 30); self.b_zout.setFixedWidth(38)
+        self.b_zpct = btn("100%", lambda: self.zoom_cmd("100"), "", "Current zoom - click for 100%  (Ctrl+1)", 30); self.b_zpct.setMinimumWidth(72)
+        self.b_zin = btn("+", lambda: self.zoom_cmd("in"), "", "Zoom in  (+  or mouse wheel up)", 30); self.b_zin.setFixedWidth(38)
+        self.b_zfit = btn("Fit", lambda: self.zoom_cmd("fit"), "", "Fit the whole photo  (Ctrl+0)", 30)
+        self.b_zreset = btn("Reset View", lambda: self.zoom_cmd("reset"), "", "Reset zoom and position", 30)
+        self.b_zfull = btn("⛶ Full Preview", self.toggle_full_preview, "", "Hide the side panels for a bigger preview  (F11, Esc = back)", 30)
+        self.s_bgbrush = hslider(2, 300, 25); self.s_bgbrush.valueChanged.connect(self.on_bg_brush); self.l_bgbrush = QLabel("Brush Size: 25 px")
+        self._load_workflow_settings()
+        self._connect_workflow_settings()
+
+    def _workflow_defaults(self):
+        return {
+            "crop": True, "manual": False, "bg": True, "enh": True,
+            "smooth": True, "tone": False, "shine": False,
+            "face": False, "hair": False,
+            "smooth_strength": 50, "tone_strength": 50, "enh_strength": 60,
+            "face_strength": 35, "hair_strength": 100
+        }
+
+    def _load_workflow_settings(self):
+        d = self._workflow_defaults()
+        try:
+            with open(WORKFLOW_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            if isinstance(saved, dict):
+                d.update(saved)
+        except Exception:
+            pass
+        checks = (
+            ("crop", self.c_crop), ("manual", self.c_manual), ("bg", self.c_bg),
+            ("enh", self.c_enh), ("smooth", self.c_smooth), ("tone", self.c_tone),
+            ("shine", self.c_shine), ("face", self.c_face), ("hair", self.c_hair)
+        )
+        for key, widget in checks:
+            widget.setChecked(bool(d.get(key, False)))
+        sliders = (
+            ("smooth_strength", self.s_smooth), ("tone_strength", self.s_tone),
+            ("enh_strength", self.s_enh), ("face_strength", self.s_aiface),
+            ("hair_strength", self.s_hair)
+        )
+        for key, widget in sliders:
+            try: widget.setValue(int(d.get(key, widget.value())))
+            except Exception: pass
+
+    def save_workflow_settings(self):
+        d = {
+            "crop": self.c_crop.isChecked(), "manual": self.c_manual.isChecked(),
+            "bg": self.c_bg.isChecked(), "enh": self.c_enh.isChecked(),
+            "smooth": self.c_smooth.isChecked(), "tone": self.c_tone.isChecked(),
+            "shine": self.c_shine.isChecked(), "face": self.c_face.isChecked(),
+            "hair": self.c_hair.isChecked(),
+            "smooth_strength": self.s_smooth.value(), "tone_strength": self.s_tone.value(),
+            "enh_strength": self.s_enh.value(), "face_strength": self.s_aiface.value(),
+            "hair_strength": self.s_hair.value()
+        }
+        try:
+            with open(WORKFLOW_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(d, f, indent=1)
+            self.status_msg("Auto workflow settings saved")
+        except Exception as e:
+            log.warning("workflow settings save failed: %s", e)
+            self.status_msg("Could not save workflow settings")
+
+    def reset_workflow_settings(self):
+        d = self._workflow_defaults()
+        checks = (
+            ("crop", self.c_crop), ("manual", self.c_manual), ("bg", self.c_bg),
+            ("enh", self.c_enh), ("smooth", self.c_smooth), ("tone", self.c_tone),
+            ("shine", self.c_shine), ("face", self.c_face), ("hair", self.c_hair)
+        )
+        for key, widget in checks:
+            widget.setChecked(bool(d[key]))
+        for key, widget in (
+            ("smooth_strength", self.s_smooth), ("tone_strength", self.s_tone),
+            ("enh_strength", self.s_enh), ("face_strength", self.s_aiface),
+            ("hair_strength", self.s_hair)
+        ):
+            widget.setValue(int(d[key]))
+        try:
+            if os.path.isfile(WORKFLOW_SETTINGS_PATH):
+                os.remove(WORKFLOW_SETTINGS_PATH)
+        except Exception:
+            pass
+        self.status_msg("Auto workflow restored to Default")
+
+    def _connect_workflow_settings(self):
+        widgets = (
+            self.c_crop, self.c_manual, self.c_bg, self.c_enh, self.c_smooth,
+            self.c_tone, self.c_shine, self.c_face, self.c_hair,
+            self.s_smooth, self.s_tone, self.s_enh, self.s_aiface, self.s_hair
+        )
+        # Autosave changes, while Save Settings remains available as an explicit action.
+        for w in widgets:
+            if isinstance(w, QSlider):
+                w.valueChanged.connect(lambda *_: self.save_workflow_settings())
+            else:
+                w.toggled.connect(lambda *_: self.save_workflow_settings())
 
     def fix_clicked(self):
         if self.stack.currentIndex() == 1 and self.finfo is not None and self.box is not None:
-            self.box[:] = ideal_box(self.finfo, self.preset, self.alpha_np()); self.base_h = self.box[2]; self.on_box_changed(); self.crop_view.update(); self._q_timer.start()
+            self.box[:] = ideal_box(self.finfo, self.preset, self.alpha_np(), img_size=self.rgb.size); self.base_h = self.box[2]; self.on_box_changed(); self.crop_view.update(); self._q_timer.start()
         else: self.auto_fix()
 
     # ================= layout =================
     def build_layout(self):
         # --- row A: the main workflow ---
-        self.btn_ai = btn("✨  AI PASSPORT PHOTO", self.ai_passport, BTN_GREEN + "QPushButton{font-size:19px;}", "One click: face, background, hair edges, enhance, retouch, crop.   এক ক্লিকে পাসপোর্ট ছবি", 56)
-        self.btn_ai.setMinimumWidth(330)
+        self.btn_ai = btn("✨  AI PHOTO", self.ai_visa, BTN_GREEN + "QPushButton{font-size:19px;}", "AI photo workflow", 56)
+        self.btn_ai.setMinimumWidth(260)
         rowA = QHBoxLayout(); rowA.setSpacing(8)
         rowA.addWidget(btn("📂  1  Open Photo", self.open_photo, BTN_BLUE, "ছবি খুলুন  (Ctrl+O)", 56)); rowA.addWidget(self.btn_ai, 2)
         rowA.addWidget(btn("AI Visa Photo", self.ai_visa, "", "Visa 40x50 mm", 56)); rowA.addWidget(btn("AI ID Photo", self.ai_id, "", "NID / ID photo", 56))
@@ -4014,31 +4678,36 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
         for b in self.view_btns.values(): vb.addWidget(b)
         vb.addStretch(1); vb.addWidget(btn("Undo", self.undo, "", "Ctrl+Z", 30)); vb.addWidget(btn("Redo", self.redo, "", "Ctrl+Y", 30))
         chip_row = QHBoxLayout(); chip_row.addWidget(self.chip, 1); chip_row.addWidget(self.fix_btn)
-        left = QVBoxLayout(); left.addWidget(self.stack, 1); left.addLayout(vb); left.addLayout(chip_row); left.addWidget(self.notes_lbl); left.addWidget(self.status)
+        zb = QHBoxLayout(); zb.setSpacing(4)
+        for b in (self.b_zout, self.b_zpct, self.b_zin, self.b_zfit, self.b_zreset): zb.addWidget(b)
+        zb.addSpacing(8); zb.addWidget(_lbl("Wheel = zoom   |   Right / Middle drag or Space + drag = move   |   hold \\ = Original", False, "color:#667;font-size:11px;"), 1); zb.addWidget(self.b_zfull)
+        left = QVBoxLayout(); left.addWidget(self.stack, 1); left.addLayout(zb); left.addLayout(vb); left.addLayout(chip_row); left.addWidget(self.notes_lbl); left.addWidget(self.status)
         # --- right: tabs ---
         tabs = QTabWidget(); tabs.setFixedWidth(430)
         tabs.addTab(self._tab_ai(), "AI PHOTO"); tabs.addTab(self._tab_edit(), "PHOTO EDIT"); tabs.addTab(self._tab_bg(), "BACKGROUND")
         tabs.addTab(self._tab_dress(), "DRESS"); tabs.addTab(self._tab_doc(), "DOCUMENT"); tabs.addTab(self._tab_print(), "PRINT")
-        self.tabs = tabs
+        self.tabs = tabs; self.top_bar = bar
         body = QHBoxLayout(); body.addLayout(left, 1); body.addWidget(tabs)
         outer = QVBoxLayout(self); outer.setMenuBar(self.build_menu()); outer.setContentsMargins(8, 4, 8, 8); outer.setSpacing(6)
         outer.addWidget(self.banner); outer.addWidget(bar); outer.addLayout(body, 1)
+        self.stack.currentChanged.connect(self._sync_zoom_bar); self.preview.view_changed.connect(self._sync_zoom_bar); self.paint_view.view_changed.connect(self._sync_zoom_bar)
+        self._sync_zoom_bar(); self._sync_repair_ui()
 
     def _tab_ai(self):
         l = QVBoxLayout()
-        l.addWidget(group("ONE CLICK", [btn("✨ AI PASSPORT PHOTO  (F2)", self.ai_passport, BTN_GREEN + "QPushButton{font-size:15px;}", "", 46),
-                                         row(btn("AI Visa Photo", self.ai_visa), btn("AI ID Photo", self.ai_id)), btn("Auto Enhance", self.m_auto_enhance),
+        l.addWidget(group("AI PHOTO", [row(btn("AI Visa Photo", self.ai_visa), btn("AI ID Photo", self.ai_id)), btn("Auto Enhance", self.m_auto_enhance),
                                          _lbl("The AI always starts from the ORIGINAL photo, so you can run it again with another size or background.")]))
         l.addWidget(group("AI OPTIONS  (normally leave all ON)", [self.c_ai_bg, self.c_ai_enh, self.c_ai_skin, self.c_ai_restore, self.c_ai_up, self.c_auto_open]))
         l.addWidget(group("FACE", [self.face_lbl, row(btn("Face Auto Detect (F7)", self.m_face_detect), btn("Face Manual (F8)", self.m_face_manual, BTN_BLUE)),
                                    _lbl("Eyes, nose, mouth and chin are found automatically. If the face is not found, draw a box with 'Face Manual'.")]))
-        l.addWidget(group("OLD AUTO LIST  (v2 - choose your own steps)", [self.c_crop, self.c_manual, self.c_bg, self.c_enh, self.c_pimple, self.c_smooth, self.c_tone, self.c_shine, self.c_face, self.c_hair,
+        l.addWidget(group("OLD AUTO LIST  (v2 - choose your own steps)", [self.c_crop, self.c_manual, self.c_bg, self.c_enh, self.c_smooth, self.c_tone, self.c_shine, self.c_face, self.c_hair,
                                                                        row(btn("Select All", lambda: self.set_all(True)), btn("Clear", lambda: self.set_all(False))),
+                                                                       row(btn("Save Settings", self.save_workflow_settings), btn("Default", self.reset_workflow_settings)),
                                                                        btn("AUTO CHALAO  (F5)", self.run_auto, BTN_GREEN)]))
         l.addStretch(1); return _scroll(l)
 
     def set_all(self, v):
-        for c in (self.c_crop, self.c_bg, self.c_enh, self.c_pimple, self.c_smooth, self.c_tone, self.c_shine): c.setChecked(v)
+        for c in (self.c_crop, self.c_bg, self.c_enh, self.c_smooth, self.c_tone, self.c_shine): c.setChecked(v)
         if not v: self.c_face.setChecked(False); self.c_hair.setChecked(False)
 
     def _tab_edit(self):
@@ -4053,7 +4722,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
                                                                          QLabel("Enhance strength"), self.s_enh, btn("Photo Enhance PRO", self.m_enhance)]))
         l.addWidget(group("SKIN RETOUCH", [QLabel("Retouch / smooth strength"), self.s_smooth, row(btn("Skin Retouch (natural)", self.m_retouch), btn("Skin Smooth (soft)", self.m_smooth)),
                                            QLabel("Skin tone strength"), self.s_tone, btn("Skin Tone Up", self.m_tone), btn("Reduce oily shine", self.m_shine),
-                                           QLabel("Pimple / spot sensitivity"), self.s_pimple, btn("Pimple / Spot Auto Remove", self.m_pimple)]))
+                                           btn("Pimple / Spot Heal (click)", self.m_pimple)]))
         l.addWidget(group("RETOUCH STUDIO  (zoom + click)", [btn("Open Retouch Studio (F6)", lambda: self.open_retouch("heal"), BTN_PURPLE, "", 38), self.rt_tool_box, QLabel("Brush size"), self.s_brush,
                                                              _lbl("Zoom in, then click on the pimple. Scroll = zoom, right-drag = move, Enter = done, Esc = cancel.", True, "color:#666;"),
                                                              btn("Done (Enter)", lambda: self.close_retouch())]))
@@ -4062,15 +4731,26 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
         l.addWidget(group("HAIR COLOR", [self.hair_box, btn("Custom color...", self.hair_custom), QLabel("Strength"), self.s_hair,
                                          row(btn("Apply Hair Color", lambda: self.m_hair()), btn("Hair Area (brush)", self.hair_edit))]))
         l.addWidget(group("NAME / DATE under photo", [self.cap_edit, self.c_date]))
+        l.addWidget(group("EXTERNAL EDITING  (Photoshop, GIMP ...)", [
+            btn("🎨  Open in Photoshop", self.open_in_photoshop, BTN_PURPLE, "Opens the CURRENT edited photo (not the original)", 38),
+            btn("🎨  Open Edited Photo With...", self.show_ext_menu, "", "Photoshop, GIMP, Paint.NET, Affinity Photo, Windows Photos or any program", 38),
+            btn("↻  Re-import Edited Photo", self.reimport_external, BTN_ORANGE, "Bring the saved result back and keep working here", 38),
+            _lbl("The current edited photo is saved as a separate PNG (transparency kept). Your original is never changed. Save in the other program, then press Re-import.", True, "color:#666;")]))
         l.addStretch(1); return _scroll(l)
 
     def _tab_bg(self):
         l = QVBoxLayout()
-        l.addWidget(group("REMOVE BACKGROUND   ব্যাকগ্রাউন্ড মুছুন", [QLabel("Quality (Best hair = BiRefNet, needs the model download)"), self.model_box,
+        l.addWidget(group("REMOVE BACKGROUND   ব্যাকগ্রাউন্ড মুছুন", [QLabel("V2-style direct segmentation mask — no extra hair-edge blur/refinement."), self.model_box,
                                                                   row(btn("Remove Background", self.m_bg_remove, BTN_BLUE, "", 40), btn("Restore Background", self.m_bg_restore))]))
+        self.b_rep_restore = btn("Background + Restore", lambda: self.open_bg_repair("bg_restore"), "", "Paint where the AI removed too much - the ORIGINAL pixels come back", 36)
+        self.b_rep_erase = btn("Background - Eraser", lambda: self.open_bg_repair("bg_erase"), "", "Paint over leftover background to remove it", 36)
+        for b in (self.b_rep_restore, self.b_rep_erase): b.setCheckable(True)
+        self.b_rep_apply = btn("✔ Apply (Enter)", lambda: self.close_bg_repair(True), BTN_GREEN, "", 34); self.b_rep_cancel = btn("✖ Cancel (Esc)", lambda: self.close_bg_repair(False), "", "", 34)
+        l.addWidget(group("BACKGROUND REPAIR", [btn("🖌  Background Repair Brush", self.open_bg_repair, BTN_PURPLE, "Fix hair, ears, shoulders, glasses... after Remove Background", 42),
+                                                self.l_bgbrush, self.s_bgbrush, row(self.b_rep_restore, self.b_rep_erase), row(self.b_rep_apply, self.b_rep_cancel),
+                                                _lbl("<span style='color:#d32f2f'>🔴 Red</span> = Restore missing person/object<br>Eraser = Remove unwanted background<br>Scroll = Zoom<br>Right/Middle Drag = Move<br>Enter = Apply<br>Esc = Cancel", True, "color:#455a64;")]))
         l.addWidget(group("BACKGROUND COLOR", [row(*[btn(n, lambda c=c: self.set_bg(c)) for n, c in BG_COLORS.items()]), btn("Custom color...", self.pick_bg)]))
-        l.addWidget(group("HAIR EDGE REFINEMENT", [QLabel("Edge cleaning strength"), self.s_edge, btn("Refine Hair Edges", self.m_edge_refine),
-                                                   _lbl("Cleans halos and rough edges around hair. Also used automatically after Remove Background.", True, "color:#666;")]))
+        l.addWidget(group("EDGE SAFETY", [_lbl("Hair-edge refinement is intentionally OFF. The original segmentation edge is kept to avoid blurred hair and soft borders.", True, "color:#666;")]))
         l.addStretch(1); return _scroll(l)
 
     def _tab_dress(self):
@@ -4112,17 +4792,18 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, QWidget):
         add(m, "Save for Online Form (KB limit)...", self.save_online_cb); m.addSeparator()
         add(m, "Print Preview", self.print_preview); add(m, "Print...", self.print_now, "Ctrl+P"); m.addSeparator(); add(m, "Exit", self.close)
         m = mb.addMenu("&Edit")
-        add(m, "Undo", self.undo, "Ctrl+Z"); add(m, "Redo", self.redo, "Ctrl+Y"); add(m, "Reset to Original", self.reset_orig); add(m, "Original / Result", self.toggle)
+        add(m, "Undo", self.undo, "Ctrl+Z"); add(m, "Redo", self.redo, "Ctrl+Y"); add(m, "Reset to Original", self.reset_orig); add(m, "Original / Result", self.toggle); m.addSeparator()
+        add(m, "Open in Photoshop", self.open_in_photoshop, "Ctrl+Shift+P"); add(m, "Open Edited Photo With...", self.show_ext_menu); add(m, "Re-import Edited Photo", self.reimport_external)
         m = mb.addMenu("&AI Tools")
-        add(m, "✨ AI PASSPORT PHOTO", self.ai_passport, "F2"); add(m, "AI Visa Photo", self.ai_visa); add(m, "AI ID Photo", self.ai_id); add(m, "⚡ Auto Fix", self.fix_clicked, "F9"); m.addSeparator()
-        add(m, "AUTO CHALAO (old checklist)", self.run_auto, "F5"); add(m, "Face Auto Detect", self.m_face_detect, "F7"); add(m, "Face Manual (box)", self.m_face_manual, "F8"); m.addSeparator()
+        add(m, "AI Visa Photo", self.ai_visa); add(m, "AI ID Photo", self.ai_id); add(m, "⚡ Auto Fix", self.fix_clicked, "F9"); m.addSeparator()
+        add(m, "AUTO CHALAO (checklist)", self.run_auto, "F5"); add(m, "Face Auto Detect", self.m_face_detect, "F7"); add(m, "Face Manual (box)", self.m_face_manual, "F8"); m.addSeparator()
         add(m, "Photo Enhance PRO", self.m_enhance); add(m, "Auto Enhance", self.m_auto_enhance); add(m, "AI Face Restore", self.m_face_ai); add(m, "AI Upscale 2x", self.m_upscale); m.addSeparator()
         add(m, "Skin Retouch (natural)", self.m_retouch); add(m, "Skin Smooth (soft)", self.m_smooth); add(m, "Skin Tone Up", self.m_tone); add(m, "Reduce oily shine", self.m_shine)
-        add(m, "Pimple / Spot Auto Remove", self.m_pimple); add(m, "Retouch Studio (click to heal)", lambda: self.open_retouch("heal"), "F6"); m.addSeparator()
+        add(m, "Pimple / Spot Heal (click)", self.m_pimple); add(m, "Retouch Studio (click to heal)", lambda: self.open_retouch("heal"), "F6"); m.addSeparator()
         hm = m.addMenu("Hair Color")
         for n, c in HAIR_COLORS.items(): add(hm, n, lambda c=c: self.m_hair(c))
         hm.addSeparator(); add(hm, "Custom color...", self.hair_custom); add(hm, "Apply selected color", lambda: self.m_hair()); add(hm, "Hair Area (brush)", self.hair_edit); m.addSeparator()
-        add(m, "Remove Background", self.m_bg_remove); add(m, "Restore Background", self.m_bg_restore); add(m, "Refine Hair Edges", self.m_edge_refine)
+        add(m, "Remove Background", self.m_bg_remove); add(m, "Background Repair Brush (restore / eraser)", self.open_bg_repair); add(m, "Restore Background", self.m_bg_restore); add(m, "Refine Hair Edges", self.m_edge_refine)
         m = mb.addMenu("&Studio")
         add(m, "Crop (Photoshop style)", self.open_editor); self.dress_menu = m.addMenu("Dress / Suit (PNG)"); self.dress_menu.aboutToShow.connect(self.fill_dress_menu)
         add(m, "Black && White on/off", lambda: self.c_bw.setChecked(not self.c_bw.isChecked())); add(m, "Sheet Layout", self.do_layout, "Ctrl+L"); add(m, "Document Studio", self.open_doc_studio, "Ctrl+D")
