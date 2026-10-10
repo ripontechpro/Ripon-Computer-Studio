@@ -1036,27 +1036,80 @@ def auto_enhance(rgb):
     blur = cv2.GaussianBlur(rgb, (0, 0), 1.5)
     return cv2.addWeighted(rgb, 1.4, blur, -0.4, 0)
 
+def _face_roi(shape, face, pad=0.45):
+    """rectangle (x0, y0, x1, y1) around the face; skin tools only process this area"""
+    H, W = shape[:2]; x, y, w, h = face
+    x0, x1 = max(0, int(x - pad * w)), min(W, int(x + (1 + pad) * w))
+    y0, y1 = max(0, int(y - 0.55 * h)), min(H, int(y + 1.65 * h))
+    if x1 - x0 < 8 or y1 - y0 < 8: return 0, 0, W, H
+    return x0, y0, x1, y1
+
+def _on_face_roi(fn):
+    """run fn(rgb, mask, face, strength) on the face area only and paste the result back (outside the mask nothing changes anyway)"""
+    def wrapper(rgb, mask, face, strength):
+        x0, y0, x1, y1 = _face_roi(rgb.shape, face)
+        if (x1 - x0) * (y1 - y0) > 0.7 * rgb.shape[0] * rgb.shape[1]: return fn(rgb, mask, face, strength)
+        out = rgb.copy()
+        out[y0:y1, x0:x1] = fn(np.ascontiguousarray(rgb[y0:y1, x0:x1]), np.ascontiguousarray(mask[y0:y1, x0:x1]), face, strength)
+        return out
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
 def skin_mask(rgb, face):
+    """float mask HxWx1. Computed only inside the face area (fast), zero everywhere else"""
     x, y, w, h = face
-    ycrcb = cv2.cvtColor(rgb, cv2.COLOR_RGB2YCrCb)
+    H, W = rgb.shape[:2]
+    rx0, ry0, rx1, ry1 = _face_roi(rgb.shape, face, 0.55)
+    ycrcb = cv2.cvtColor(np.ascontiguousarray(rgb[ry0:ry1, rx0:rx1]), cv2.COLOR_RGB2YCrCb)
     m = cv2.inRange(ycrcb, (0, 133, 77), (255, 173, 127))
     region = np.zeros(m.shape, np.uint8)
-    x0, x1 = max(0, int(x - 0.2 * w)), min(m.shape[1], int(x + 1.2 * w))
-    y0, y1 = max(0, int(y - 0.3 * h)), min(m.shape[0], int(y + 1.4 * h))
+    x0, x1 = max(0, int(x - 0.2 * w) - rx0), min(m.shape[1], int(x + 1.2 * w) - rx0)
+    y0, y1 = max(0, int(y - 0.3 * h) - ry0), min(m.shape[0], int(y + 1.4 * h) - ry0)
     region[y0:y1, x0:x1] = 255
     m = cv2.bitwise_and(m, region)
     k = max(3, (w // 15) | 1)
     m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, np.ones((k, k), np.uint8))
     m = cv2.GaussianBlur(m, (k * 2 + 1, k * 2 + 1), 0)
-    return (m.astype(np.float32) / 255.0)[..., None]
+    out = np.zeros((H, W), np.float32)
+    out[ry0:ry1, rx0:rx1] = m.astype(np.float32) / 255.0
+    return out[..., None]
 
+def _mask_roi(mask, pad=4):
+    """bounding box of the non-zero mask (x0, y0, x1, y1) or None"""
+    m = mask[..., 0] if mask.ndim == 3 else mask
+    ys, xs = np.where(m > 0.004)
+    if not len(xs): return None
+    H, W = m.shape
+    return max(0, xs.min() - pad), max(0, ys.min() - pad), min(W, xs.max() + pad + 1), min(H, ys.max() + pad + 1)
+
+def _on_mask_roi(fn):
+    def wrapper(rgb, mask, strength):
+        r = _mask_roi(mask)
+        if r is None: return rgb
+        x0, y0, x1, y1 = r
+        out = rgb.copy()
+        out[y0:y1, x0:x1] = fn(np.ascontiguousarray(rgb[y0:y1, x0:x1]), np.ascontiguousarray(mask[y0:y1, x0:x1]), strength)
+        return out
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+def fast_bilateral(rgb, d, sigma_color, sigma_space, max_d=13):
+    """bilateral filter that stays fast for big faces: the smooth layer is computed at reduced size (it is low-frequency anyway)"""
+    if d <= max_d: return cv2.bilateralFilter(rgb, d, sigma_color, sigma_space)
+    k = max_d / float(d); H, W = rgb.shape[:2]
+    small = cv2.resize(rgb, (max(8, int(W * k)), max(8, int(H * k))), interpolation=cv2.INTER_AREA)
+    small = cv2.bilateralFilter(small, max(3, int(round(d * k)) | 1), sigma_color, max(2.0, sigma_space * k))
+    return cv2.resize(small, (W, H), interpolation=cv2.INTER_LINEAR)
+
+@_on_face_roi
 def skin_smooth(rgb, mask, face, strength):
     d = max(5, face[2] // 20)
-    sm = cv2.bilateralFilter(rgb, d, 40, d * 2)
-    sm = cv2.bilateralFilter(sm, d, 40, d * 2)
+    sm = fast_bilateral(rgb, d, 40, d * 2)
+    sm = fast_bilateral(sm, d, 40, d * 2)
     amt = mask * (strength / 100.0) * 0.85
     return np.clip(rgb * (1 - amt) + sm * amt, 0, 255).astype(np.uint8)
 
+@_on_mask_roi
 def skin_tone_up(rgb, mask, strength):
     s = strength / 100.0
     lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB).astype(np.float32)
@@ -1084,13 +1137,14 @@ def enhance_pro(rgb, strength=60):
     hsv[..., 1] = np.clip(hsv[..., 1] * (1 + 0.3 * s * (1 - sat)), 0, 255)
     return cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
 
+@_on_face_roi
 def skin_retouch(rgb, mask, face, strength):
     """Frequency-separation style: dag/rong smooth hoy kintu pore texture thake (natural dekhay)"""
     s = strength / 100.0
     w = max(face[2], 80)
     d = max(5, int(w // 25) | 1)
-    base = cv2.bilateralFilter(rgb, d, 20 + 40 * s, d * 2)
-    base = cv2.bilateralFilter(base, d, 20 + 40 * s, d * 2).astype(np.float32)
+    base = fast_bilateral(rgb, d, 20 + 40 * s, d * 2)
+    base = fast_bilateral(base, d, 20 + 40 * s, d * 2).astype(np.float32)
     f = rgb.astype(np.float32)
     tex = f - cv2.GaussianBlur(f, (0, 0), max(1.0, w / 70.0))
     tex = cv2.GaussianBlur(tex, (0, 0), 0.7)
@@ -1098,6 +1152,7 @@ def skin_retouch(rgb, mask, face, strength):
     amt = mask * (0.45 + 0.5 * s)
     return np.clip(f * (1 - amt) + out * amt, 0, 255).astype(np.uint8)
 
+@_on_mask_roi
 def skin_shine_fix(rgb, mask, strength):
     """mukher oily/chokchoke bhab kombay"""
     s = strength / 100.0
@@ -1338,7 +1393,9 @@ def draw_cut_marks(d, x, y, w, h, style):
         for cx, cy, sx, sy in ((x, y, -1, -1), (x + w, y, 1, -1), (x, y + h, -1, 1), (x + w, y + h, 1, 1)):
             d.line([cx, cy, cx + sx * L, cy], fill=col, width=1); d.line([cx, cy, cx, cy + sy * L], fill=col, width=1)
 
-def pack_sheet(items, paper, gap_mm=3, margin_mm=4, border=True, style=None, orient="Auto", center=True):
+LAST_SHEET_BLOCK = [0, 0, 0, 0, 0, 0]      # x, y, w, h of the photo block + sheet W, H  (set by pack_sheet; used by drag-to-place)
+
+def pack_sheet(items, paper, gap_mm=3, margin_mm=4, border=True, style=None, orient="Auto", center=False, align="Top Left", pos=None):
     """items = [(photo, copies), ...]. Single size: automatic best grid (both orientations, photo rotation).
     Mixed sizes: row packing. return (sheet, placed, total)  - old v2 signature still works."""
     if style is None: style = "Light border" if border else "None"
@@ -1364,7 +1421,13 @@ def pack_sheet(items, paper, gap_mm=3, margin_mm=4, border=True, style=None, ori
         used_rows = int(math.ceil(n / cols)) if n else 0
         used_cols = min(cols, n)
         bw = used_cols * w + max(0, used_cols - 1) * gap; bh = used_rows * h + max(0, used_rows - 1) * gap
-        x0 = (PW - bw) // 2 if center else mg; y0 = (PH - bh) // 2 if center else mg
+        if pos is not None:                                   # user dragged the block: keep it fully inside the paper
+            x0 = int(max(0, min(PW - bw, pos[0]))); y0 = int(max(0, min(PH - bh, pos[1])))
+        else:
+            al = "Center" if center else align
+            x0 = (PW - bw) // 2 if al in ("Center", "Top Center") else mg
+            y0 = (PH - bh) // 2 if al == "Center" else mg
+        LAST_SHEET_BLOCK[:] = [x0, y0, bw, bh, PW, PH]
         for i in range(n):
             x = x0 + (i % cols) * (w + gap); y = y0 + (i // cols) * (h + gap)
             sheet.paste(ph_img, (x, y)); draw_cut_marks(d, x, y, w, h, style)
@@ -1387,15 +1450,17 @@ def pack_sheet(items, paper, gap_mm=3, margin_mm=4, border=True, style=None, ori
         if placed == total: break
     return best[0], best[1], total
 
-def make_sheets(photo, copies, paper, gap_mm=3, margin_mm=4, style="Light border", orient="Auto"):
+def make_sheets(photo, copies, paper, gap_mm=3, margin_mm=4, style="Light border", orient="Auto", align="Top Left", pos=None):
     """as many sheets as needed for 'copies'. returns list of sheet images"""
     gap, mg = mm2px(gap_mm), mm2px(margin_mm)
     bl = best_layout(photo.width, photo.height, paper, gap, mg)
     cap = max(1, bl["cap"]); sheets = []; left = copies
     while left > 0:
-        s, placed, _ = pack_sheet([(photo, min(left, cap))], paper, gap_mm, margin_mm, style=style, orient=orient)
+        s, placed, _ = pack_sheet([(photo, min(left, cap))], paper, gap_mm, margin_mm, style=style, orient=orient, align=align, pos=pos)
+        if not sheets: first_block = list(LAST_SHEET_BLOCK)
         sheets.append(s); left -= max(1, placed)
         if len(sheets) > 50: break
+    if sheets: LAST_SHEET_BLOCK[:] = first_block          # drag-to-place follows sheet 1
     return sheets
 
 def layout_text(photo_mm, paper_name, paper_px_, gap_mm, margin_mm, copies, orient="Auto"):
@@ -2513,10 +2578,33 @@ class PreviewView(ZoomView):
     """The big main preview (Photo / Print Sheet / Original). Zoom and move change only the view.
     The view of every image size is remembered, so Original <-> Edited keeps your zoom on each."""
     peek = Signal(bool)                       # hold the backslash key = temporary Original
+    drag_started = Signal()                   # Print Sheet: left-drag moves the photos on the paper
+    drag_moved = Signal(float, float)         # cumulative movement in image pixels since the press
+    drag_ended = Signal()
     def __init__(self):
         super().__init__()
         self.setMinimumSize(560, 600); self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
         self.pm = None; self._states = {}; self._peeking = False
+        self.drag_enabled = False; self._dragging = False; self._dstart = (0.0, 0.0)
+
+    def set_drag_enabled(self, on):
+        self.drag_enabled = bool(on); self._base_cursor = Qt.SizeAllCursor if on else Qt.ArrowCursor
+        if not self._panning: self.setCursor(self._base_cursor)
+
+    def mousePressEvent(self, e):
+        if self._pan_press(e): return
+        if self.drag_enabled and self.pm is not None and e.button() == Qt.LeftButton:
+            self._dragging = True; self._dstart = self._w2i(e.position()); self.setCursor(Qt.ClosedHandCursor); self.drag_started.emit()
+
+    def mouseMoveEvent(self, e):
+        if self._pan_move(e): return
+        if self._dragging:
+            ix, iy = self._w2i(e.position()); self.drag_moved.emit(ix - self._dstart[0], iy - self._dstart[1])
+
+    def mouseReleaseEvent(self, e):
+        self._pan_release(e)
+        if self._dragging and e.button() == Qt.LeftButton:
+            self._dragging = False; self.setCursor(self._base_cursor); self.drag_ended.emit()
 
     def has_image(self): return self.pm is not None
 
@@ -2634,19 +2722,31 @@ class PaintView(ZoomView):
         self.setMinimumSize(560, 650)
         self.pm = None; self.ov = None; self.rep = None; self.tool = "heal"; self.radius = 12; self.on_action = None
         self.dirty_hair = False; self._paint = False; self._lastimg = None; self._cur = None
+        self._arr = None; self._erase_now = False; self._ctrl = False
 
     def has_image(self): return self.pm is not None or self.rep is not None
 
     def set_image(self, arr, keep_view=False):
+        # QImage shares the numpy buffer (no pixmap copy): a healed spot only needs a repaint, not a rebuild of the whole picture
         arr = np.ascontiguousarray(arr); h, w = arr.shape[:2]
-        self.pm = QPixmap.fromImage(QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888))
+        self._arr = arr
+        self.pm = QImage(arr.data, w, h, 3 * w, QImage.Format_RGB888)
         self.iw, self.ih = w, h
         if not keep_view: self.fit_view()
         self.update()
 
-    def refresh(self, arr): self.set_image(arr, True)
+    def refresh(self, arr):
+        if arr is self._arr and self.pm is not None: self.update()
+        else: self.set_image(arr, True)
 
-    def clear(self): self.pm = None; self.ov = None; self.rep = None; self._paint = False; self.update()
+    def clear(self): self.pm = None; self._arr = None; self.ov = None; self.rep = None; self._paint = False; self.update()
+
+    def clear_overlay(self):
+        """remove the whole hair selection (the hair colour is only applied to what is red)"""
+        if self.iw > 1:
+            self.ov = QImage(self.iw, self.ih, QImage.Format_ARGB32_Premultiplied); self.ov.fill(0)
+        else: self.ov = None
+        self.dirty_hair = True; self.update()
 
     # ---- Background Repair ----
     def begin_repair(self, rgb, alpha, tool):
@@ -2720,7 +2820,11 @@ class PaintView(ZoomView):
             if self.ov is not None and self.tool.startswith("hair"): self._draw_layer(p, self.ov, s, ox, oy, clip)
         if self._cur is not None:
             r = self.radius * s; p.setBrush(Qt.NoBrush); p.setRenderHint(QPainter.Antialiasing, True)
-            ring = {"bg_restore": QColor(255, 40, 40), "bg_erase": QColor(0, 160, 255)}.get(self.tool) if self.rep is not None else None
+            if self.rep is not None: ring = {"bg_restore": QColor(255, 40, 40), "bg_erase": QColor(0, 160, 255)}.get(self.tool)
+            elif self.tool.startswith("hair"):
+                er = self._erase_now if self._paint else (self.tool == "hair_erase" or self._ctrl)
+                ring = QColor(0, 160, 255) if er else QColor(255, 40, 40)
+            else: ring = None
             p.setPen(QPen(QColor(255, 255, 255), 2)); p.drawEllipse(self._cur, r, r)
             p.setPen(QPen(ring or QColor(0, 0, 0), 1, Qt.DashLine)); p.drawEllipse(self._cur, r, r)
         p.end()
@@ -2737,18 +2841,27 @@ class PaintView(ZoomView):
         if self.tool == "heal":
             if self.on_action: self.on_action("heal", ix, iy)
         else:
+            # hair brush: Add mode paints, Remove mode erases.  Hold Ctrl in Add mode = erase (and the other way round)
+            ctrl = bool(e.modifiers() & Qt.ControlModifier)
+            self._erase_now = (self.tool == "hair_erase") != ctrl
             self._paint = True; self._lastimg = (ix, iy)
-            self._stroke((ix, iy), (ix, iy), self.tool == "hair_erase"); self.update()
+            self._stroke((ix, iy), (ix, iy), self._erase_now); self._update_stroke((ix, iy), (ix, iy))
+
+    def _update_stroke(self, a, b):
+        """repaint only the rectangle the hair brush touched (full repaints made the brush slow when zoomed in)"""
+        s, ox, oy = self._geom(); r = self.radius * s + 6
+        x0, x1 = sorted((ox + a[0] * s, ox + b[0] * s)); y0, y1 = sorted((oy + a[1] * s, oy + b[1] * s))
+        self.update(QRect(int(x0 - r), int(y0 - r), int(x1 - x0 + 2 * r) + 1, int(y1 - y0 + 2 * r) + 1))
 
     def mouseMoveEvent(self, e):
-        old = self._cur; self._cur = e.position()
+        old = self._cur; self._cur = e.position(); self._ctrl = bool(e.modifiers() & Qt.ControlModifier)
         if self._pan_move(e): return
         if self._paint:
             ix, iy = self._w2i(e.position())
             if self.rep is not None: self._dab(self._lastimg, (ix, iy))
-            else: self._stroke(self._lastimg, (ix, iy), self.tool == "hair_erase")
+            else:
+                self._stroke(self._lastimg, (ix, iy), self._erase_now); self._update_stroke(self._lastimg, (ix, iy))
             self._lastimg = (ix, iy)
-        if self.rep is None: self.update(); return
         if old is not None: self.update(self._ring_rect(old))
         self.update(self._ring_rect(self._cur))
 
@@ -3529,7 +3642,7 @@ class CoreMixin:
         self.view_mode = mode
         for k, b in self.view_btns.items(): b.setChecked(k == mode)
         if mode == "sheet" and not self.sheets and self.photo is not None: self.make_sheet()
-        self.show_current()
+        self.show_current(); self._sync_drag()
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -3715,6 +3828,7 @@ class CoreMixin:
         if self.rgb is not None and self.stack.currentIndex() == 0 and (self.photo_base is not None):
             if self.finfo is not None and reframe: self.box = ideal_box(self.finfo, self.preset, self.alpha_np(), img_size=self.rgb.size); self.base_h = self.box[2]
             self.apply_crop()
+        self.sheet_pos = None
         self.update_layout_info(); self._mark_dirty()
 
     def set_bg_silent(self, rgb):
@@ -4111,6 +4225,14 @@ class EditMixin:
         self._bg_op("Changing hair color...", lambda ctx: apply_hair_color(arr, hm, col, st), lambda r: self._done_rgb(r, "Hair color changed"))
 
     def hair_edit(self): self.open_retouch("hair_add")
+    def hair_remove(self): self.open_retouch("hair_erase")
+
+    def hair_clear(self):
+        """remove the whole hair selection"""
+        if not self.need_img(): return
+        if self.stack.currentIndex() == 2 and not self.repair_active: self.paint_view.clear_overlay()
+        else: self.hair_mask = np.zeros((self.rgb.height, self.rgb.width), np.float32)
+        self.status_msg("Hair selection cleared. Use Hair + to paint it again.")
 
     # ---------- Retouch Studio ----------
     def open_retouch(self, tool="heal"):
@@ -4133,7 +4255,8 @@ class EditMixin:
             else: self.hair_mask = hair_mask_auto(np.array(self.rgb), self.face, self.alpha_np()); self.paint_view.set_overlay(self.hair_mask)
         self.paint_view.update()
         self.status_msg("Click on a pimple (brush a little bigger than it). Scroll = zoom, Right-drag = move. Enter = Done, Esc = Cancel"
-                        if tool == "heal" else "Red = hair. Brush adds, eraser removes. Enter = Done, then 'Apply Hair Color'")
+                        if tool == "heal" else ("Hair + : paint the hair (red). Hold Ctrl = erase.  Enter = Done, then 'Apply Hair Color'" if tool == "hair_add"
+                                                else "Hair - : paint over the red area to REMOVE it from the hair selection. Hold Ctrl = add.  Enter = Done"))
 
     def on_brush(self, v):
         if self.repair_active: return                       # the Background Repair brush has its own size slider
@@ -4329,9 +4452,11 @@ class OutputMixin:
         self._mark_dirty()
 
     def on_print_option(self, *_):
+        if self.sender() in (self.paper_box, self.orient_box): self.sheet_pos = None        # new paper: start from the top again
         self.sp_pw.setVisible(self.paper_box.currentText() == CUSTOM_PAPER); self.sp_ph.setVisible(self.paper_box.currentText() == CUSTOM_PAPER)
         self.sheets = []; self.update_layout_info()
         if self.view_mode == "sheet" and self.photo is not None: self.make_sheet(); self.show_current()
+        self._sync_drag()
 
     def make_sheet(self):
         """build every sheet needed for the chosen copies (best layout is automatic)"""
@@ -4344,8 +4469,39 @@ class OutputMixin:
             self.sheets = [s]
             if placed < total: QMessageBox.information(self, "Not enough space", "%d of %d photos fit. Reduce the copies or use bigger paper." % (placed, total))
         else:
-            self.sheets = make_sheets(self.photo, self.copies.value(), paper, gap, mg, style, orient)
+            self.sheets = make_sheets(self.photo, self.copies.value(), paper, gap, mg, style, orient,
+                                      align=self.align_box.currentText(), pos=self.sheet_pos)
         self.sheet = self.sheets[0]; return True
+
+    # ---------- drag the photos to any place on the paper ----------
+    def _sync_drag(self):
+        self.preview.set_drag_enabled(self.view_mode == "sheet" and self.stack.currentIndex() == 0 and bool(self.sheets) and not self.c_mix.isChecked())
+
+    def _sheet_drag_start(self):
+        self._drag_base = list(LAST_SHEET_BLOCK[:2]) if self.sheets else None
+
+    def _sheet_drag_move(self, dx, dy):
+        if self._drag_base is None: return
+        self.sheet_pos = (self._drag_base[0] + dx, self._drag_base[1] + dy)
+        if not self._drag_timer.isActive(): self._drag_timer.start()
+
+    def _sheet_drag_apply(self):
+        if self.photo is None or self.sheet_pos is None: return
+        self.make_sheet(); self.show_current()
+
+    def _sheet_drag_end(self):
+        self._drag_timer.stop(); self._sheet_drag_apply()
+        self.sheet_pos = (LAST_SHEET_BLOCK[0], LAST_SHEET_BLOCK[1])          # keep the clamped (inside the paper) position
+        self.status_msg("Photos placed at %.1f mm from left, %.1f mm from top   (drag again to move)" % (
+            self.sheet_pos[0] / DPI * 25.4, self.sheet_pos[1] / DPI * 25.4))
+        self._mark_dirty()
+
+    def sheet_align_changed(self, *_):
+        self.sheet_pos = None
+        if self.photo is not None: self.make_sheet(); self.show_current()
+
+    def sheet_pos_reset(self):
+        self.align_box.setCurrentText("Top Left"); self.sheet_align_changed()
 
     def do_layout(self):
         if self.photo is None: return QMessageBox.information(self, APP_NAME, "Make the photo first (AI Visa/ID Photo or Crop).")
@@ -4868,6 +5024,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         self._fix_queue = []; self._dirty = False; self._saved_rev = 0; self._pending_face_action = None; self._report = []
         self.job_id = None; self.job_folder = None; self.src_path = self.inbox_path = None; self._last_saved_dir = None
         self.doc_studio = None; self._dress_cache = {}
+        self.sheet_pos = None; self._drag_base = None
         self.db = ShopDB(); self.presets = load_presets()
         self.preset_name = next(iter(self.presets)); self.preset = dict(self.presets[self.preset_name])
         self.runner = TaskRunner(self); self.runner.progress.connect(self._on_progress)
@@ -4988,6 +5145,9 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         self.sp_ph = QDoubleSpinBox(); self.sp_ph.setRange(30, 1500); self.sp_ph.setValue(297); self.sp_ph.setSuffix(" mm high"); self.sp_ph.valueChanged.connect(self.on_print_option)
         self.sp_pw.setVisible(False); self.sp_ph.setVisible(False)
         self.orient_box = QComboBox(); self.orient_box.addItems(["Auto", "Portrait", "Landscape"]); self.orient_box.currentIndexChanged.connect(self.on_print_option)
+        self.align_box = QComboBox(); self.align_box.addItems(["Top Left", "Top Center", "Center"]); self.align_box.activated.connect(self.sheet_align_changed)
+        self._drag_timer = QTimer(self); self._drag_timer.setSingleShot(True); self._drag_timer.setInterval(35); self._drag_timer.timeout.connect(self._sheet_drag_apply)
+        self.preview.drag_started.connect(self._sheet_drag_start); self.preview.drag_moved.connect(self._sheet_drag_move); self.preview.drag_ended.connect(self._sheet_drag_end)
         self.cut_box = QComboBox(); self.cut_box.addItems(["Light border", "Cut marks", "None"]); self.cut_box.currentIndexChanged.connect(self.on_print_option)
         self.sp_gap = QDoubleSpinBox(); self.sp_gap.setRange(0, 30); self.sp_gap.setValue(3); self.sp_gap.setSuffix(" mm gap"); self.sp_gap.valueChanged.connect(self.on_print_option)
         self.sp_margin = QDoubleSpinBox(); self.sp_margin.setRange(0, 30); self.sp_margin.setValue(4); self.sp_margin.setSuffix(" mm margin"); self.sp_margin.valueChanged.connect(self.on_print_option)
@@ -5188,13 +5348,16 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         l.addWidget(group("SKIN RETOUCH", [QLabel("Retouch / smooth strength"), self.s_smooth, row(btn("Skin Retouch (natural)", self.m_retouch), btn("Skin Smooth (soft)", self.m_smooth)),
                                            QLabel("Skin tone strength"), self.s_tone, btn("Skin Tone Up", self.m_tone), btn("Reduce oily shine", self.m_shine),
                                            btn("Pimple / Spot Heal (click)", self.m_pimple)]))
-        l.addWidget(group("RETOUCH STUDIO  (zoom + click)", [btn("Open Retouch Studio (F6)", lambda: self.open_retouch("heal"), BTN_PURPLE, "", 38), self.rt_tool_box, QLabel("Brush size"), self.s_brush,
+        l.addWidget(group("RETOUCH STUDIO  (zoom + click)", [btn("Open Retouch Studio (F6)", lambda: self.open_retouch("heal"), BTN_PURPLE, "", 38), self.rt_tool_box,
+                                                             row(btn("➕ Hair Add", self.hair_edit, "", "Paint the hair area (red)", 32), btn("➖ Hair Remove", self.hair_remove, "", "Eraser: remove parts from the red hair area  (Ctrl + drag also erases)", 32)),
+                                                             btn("Clear hair selection", self.hair_clear), QLabel("Brush size"), self.s_brush,
                                                              _lbl("Zoom in, then click on the pimple. Scroll = zoom, right-drag = move, Enter = done, Esc = cancel.", True, "color:#666;"),
                                                              btn("Done (Enter)", lambda: self.close_retouch())]))
         l.addWidget(group("FACE RESTORE / UPSCALE", [QLabel("Face restore strength (low = closer to the real face)"), self.s_aiface,
                                                      row(btn("AI Face Restore", self.m_face_ai), btn("AI Upscale 2x", self.m_upscale))]))
         l.addWidget(group("HAIR COLOR", [self.hair_box, btn("Custom color...", self.hair_custom), QLabel("Strength"), self.s_hair,
-                                         row(btn("Apply Hair Color", lambda: self.m_hair()), btn("Hair Area (brush)", self.hair_edit))]))
+                                         row(btn("Apply Hair Color", lambda: self.m_hair()), btn("Hair Area (brush)", self.hair_edit)),
+                                         row(btn("➖ Hair Remove (eraser)", self.hair_remove), btn("Clear selection", self.hair_clear))]))
         l.addWidget(group("NAME / DATE under photo", [self.cap_edit, self.c_date]))
         l.addWidget(group("EXTERNAL EDITING  (Photoshop, GIMP ...)", [
             btn("🎨  Open in Photoshop", self.open_in_photoshop, BTN_PURPLE, "Opens the CURRENT edited photo (not the original)", 38),
@@ -5237,6 +5400,8 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
     def _tab_print(self):
         l = QVBoxLayout()
         l.addWidget(group("PAPER", [QLabel("Paper and copies are chosen at the top bar."), self.sp_pw, self.sp_ph, row(QLabel("Orientation"), self.orient_box),
+                                    row(QLabel("Photos start at"), self.align_box, btn("Reset", self.sheet_pos_reset, "", "Back to top-left", 28)),
+                                    _lbl("Print Sheet view: drag the photos with the left mouse button to place them anywhere on the paper. (Right-drag = move the view.)", True, "color:#1565c0;"),
                                     row(QLabel("Cut lines"), self.cut_box), self.sp_gap, self.sp_margin, self.layout_lbl]))
         l.addWidget(group("MIXED SHEET", [self.c_mix, self.size2_box, self.copies2]))
         l.addWidget(group("PRINT", [btn("Sheet Layout / Preview (Ctrl+L)", self.do_layout, "", "", 38), btn("🔍 Print Preview", self.print_preview), btn("🖨 Print...  (printer, copies)", self.print_now, BTN_BLUE, "", 40),
