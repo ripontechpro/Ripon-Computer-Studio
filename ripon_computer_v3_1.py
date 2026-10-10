@@ -210,6 +210,8 @@ MODEL_REGISTRY = collections.OrderedDict([
                         file=os.path.join("realesrgan", "RealESRGAN_x4plus.pth"),
                         url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
                         note="Only for small photos. Needs torch + realesrgan.")),
+    ("liveportrait", dict(label="AI Pose Straighten (LivePortrait)", size="~3-5 GB", kind="liveportrait",
+                          note="Crooked / turned / bent head -> straight. Needs NVIDIA GPU for speed. Non-commercial (InsightFace). Download = installs code + packages + model.")),
 ])
 BG_MODEL_KEYS = ["u2net_human_seg", "birefnet-portrait", "bria-rmbg"]
 MODELS = {   # v2 names -> rembg ids (kept so old code/menus still work)
@@ -272,6 +274,7 @@ class ModelHub:
         r = MODEL_REGISTRY[key]
         if r["kind"] == "file": return os.path.isfile(self.path_of(key)) and os.path.getsize(self.path_of(key)) > 1000
         if r["kind"] == "rembg": return os.path.isfile(os.path.join(os.environ["U2NET_HOME"], key + ".onnx"))
+        if r["kind"] == "liveportrait": return liveportrait_ok(SETTINGS.get("lp_dir", ""))
         if r["kind"] == "insightface":
             return os.path.isfile(os.path.join(MODELS_DIR, "insightface", "models", "buffalo_l", "det_10g.onnx"))
         return False
@@ -325,6 +328,12 @@ class ModelHub:
         elif r["kind"] == "insightface":
             if progress: progress("Downloading InsightFace models ...", None)
             self._insight(force_cpu=True)
+        elif r["kind"] == "liveportrait":
+            class _C:
+                def check(self_): pass
+                def msg(self_, t):
+                    if progress: progress(t, None)
+            code = install_liveportrait(os.path.join(APP_DIR, "ai_pose"), _C()); SETTINGS["lp_dir"] = code; save_settings()
         self.errors.pop(key, None)
 
     def unload(self, key=None):
@@ -964,6 +973,32 @@ LP_SETUP = ("LivePortrait is a free AI model (head pose / face re-orientation).\
 
 def liveportrait_ok(d):
     return bool(d) and os.path.isfile(os.path.join(d, "inference.py")) and os.path.isdir(os.path.join(d, "pretrained_weights"))
+
+def install_liveportrait(target, ctx=None):
+    """one-click install on THIS PC: download LivePortrait code, python packages, model weights (several GB). Returns the folder."""
+    os.makedirs(target, exist_ok=True); kw = {}
+    if os.name == "nt": kw["creationflags"] = 0x08000000
+    def run(cmd, cwd, label, timeout=7200):
+        if ctx: ctx.check(); ctx.msg(label)
+        r = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout, **kw)
+        if r.returncode != 0: raise RuntimeError("%s failed:\n%s" % (label, ((r.stderr or "") + (r.stdout or ""))[-1200:]))
+    code = os.path.join(target, "LivePortrait")
+    if not os.path.isfile(os.path.join(code, "inference.py")):
+        if shutil.which("git"):
+            run(["git", "clone", "--depth", "1", "https://github.com/KwaiVGI/LivePortrait", code], target, "Step 1/4: downloading LivePortrait code...")
+        else:
+            import zipfile
+            if ctx: ctx.msg("Step 1/4: downloading LivePortrait code (zip)...")
+            zp = os.path.join(target, "lp.zip"); urllib.request.urlretrieve("https://github.com/KwaiVGI/LivePortrait/archive/refs/heads/main.zip", zp)
+            with zipfile.ZipFile(zp) as z: z.extractall(target)
+            os.replace(os.path.join(target, "LivePortrait-main"), code); os.remove(zp)
+    py = SETTINGS.get("lp_python") or sys.executable
+    run([py, "-m", "pip", "install", "-r", "requirements.txt"], code, "Step 2/4: installing Python packages (torch etc., big, please wait)...")
+    run([py, "-m", "pip", "install", "huggingface_hub"], code, "Step 3/4: installing downloader...")
+    run([py, "-c", "from huggingface_hub import snapshot_download as d; d('KwaiVGI/LivePortrait', local_dir='pretrained_weights', ignore_patterns=['*.git*','README.md','docs/*','liveportrait_animals/*'])"],
+        code, "Step 4/4: downloading AI model files (a few GB)...")
+    if not liveportrait_ok(code): raise RuntimeError("Install finished but inference.py / pretrained_weights were not found in " + code)
+    return code
 
 def run_liveportrait_straight(rgb, lp_dir, ref_path, py=None, ctx=None, timeout=900):
     """AI: re-pose the head to the pose of a straight, front-facing REFERENCE photo (identity stays from `rgb`).
@@ -4083,6 +4118,12 @@ class EditMixin:
         if not self.need_img(): return
         d = SETTINGS.get("lp_dir", "")
         if not liveportrait_ok(d):
+            auto_dir = os.path.join(APP_DIR, "ai_pose")
+            if ask_yes_no(self, "AI Straighten (LivePortrait)", "The AI model is not installed yet.\n\nInstall it automatically now?\nIt downloads several GB and can take 10-30 minutes (internet needed, one time only).\nFolder: %s\n\nYes = install now     No = I already have it / choose folder manually" % auto_dir):
+                if self.runner.busy: return self.status_msg("Please wait - a job is running.")
+                def done(code):
+                    SETTINGS["lp_dir"] = code; save_settings(); self.banner.done("AI pose model installed - press the button again"); QMessageBox.information(self, "LivePortrait", "Installed.\nPress 'AI Straighten Pose' again.")
+                return self._bg_op("Installing AI pose model...", lambda ctx: install_liveportrait(auto_dir, ctx), done, history=False)
             QMessageBox.information(self, "AI Straighten (LivePortrait)", LP_SETUP)
             d = QFileDialog.getExistingDirectory(self, "Choose the LivePortrait folder (contains inference.py)", d or "")
             if not d: return
@@ -4689,6 +4730,7 @@ class AIMixin:
     # ---------- AI model jobs ----------
     def _load_key(self, key):
         r = MODEL_REGISTRY[key]
+        if r["kind"] == "liveportrait": return          # runs as its own program when used
         if r["kind"] == "insightface": HUB._insight()
         elif r["kind"] == "rembg": HUB._rembg_session(key)
         elif key == "gfpgan": HUB._gfpgan()
