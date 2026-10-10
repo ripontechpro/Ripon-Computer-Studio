@@ -952,6 +952,51 @@ def straighten_pose(rgb, alpha, fi, strength=1.0):
     a = np.clip(a2 * wgt + alpha * (1 - wgt), 0, 1).astype(np.float32)
     return out, a, ang
 
+# ---------------------------------------------------------------------
+#  AI POSE STRAIGHTEN  (LivePortrait, runs on YOUR PC - not bundled)
+# ---------------------------------------------------------------------
+LP_SETUP = ("LivePortrait is a free AI model (head pose / face re-orientation).\n"
+            "Install once on this PC (needs Python, Git; NVIDIA GPU recommended):\n\n"
+            "  git clone https://github.com/KwaiVGI/LivePortrait\n  cd LivePortrait\n  pip install -r requirements.txt\n"
+            "  huggingface-cli download KwaiVGI/LivePortrait --local-dir pretrained_weights --exclude \"*.git*\" \"README.md\" \"docs\"\n\n"
+            "Then choose the LivePortrait folder (the one that contains inference.py).\n"
+            "Note: LivePortrait's face detector (InsightFace) is for non-commercial use.")
+
+def liveportrait_ok(d):
+    return bool(d) and os.path.isfile(os.path.join(d, "inference.py")) and os.path.isdir(os.path.join(d, "pretrained_weights"))
+
+def run_liveportrait_straight(rgb, lp_dir, ref_path, py=None, ctx=None, timeout=900):
+    """AI: re-pose the head to the pose of a straight, front-facing REFERENCE photo (identity stays from `rgb`).
+    Uses LivePortrait's own command line with absolute motion. Returns RGB uint8 array (same size as input)."""
+    import tempfile
+    py = py or sys.executable; work = tempfile.mkdtemp(prefix="ripon_lp_"); src = os.path.join(work, "src.png"); out = os.path.join(work, "out")
+    os.makedirs(out, exist_ok=True); Image.fromarray(rgb).save(src)
+    last = ""
+    for flag in ("--no_flag_relative_motion", "--no-flag-relative-motion"):
+        if ctx: ctx.check(); ctx.msg("AI is straightening the pose (first run loads the model, can take a minute)...")
+        cmd = [py, "inference.py", "-s", src, "-d", ref_path, "--output_dir", out, flag]
+        kw = dict(cwd=lp_dir, capture_output=True, text=True, timeout=timeout)
+        if os.name == "nt": kw["creationflags"] = 0x08000000      # no black console window
+        try: r = subprocess.run(cmd, **kw)
+        except subprocess.TimeoutExpired: raise RuntimeError("LivePortrait took too long (over %d s)." % timeout)
+        last = ((r.stderr or "") + (r.stdout or ""))[-1200:]
+        if r.returncode == 0:
+            files = [f for f in glob.glob(os.path.join(out, "*")) if f.lower().endswith((".jpg", ".jpeg", ".png", ".mp4"))]
+            pics = [f for f in files if "concat" not in os.path.basename(f).lower() and not f.lower().endswith(".mp4")]
+            if not pics:
+                mp4 = [f for f in files if "concat" not in os.path.basename(f).lower() and f.lower().endswith(".mp4")]
+                if mp4:
+                    cap = cv2.VideoCapture(mp4[0]); ok, fr = cap.read(); cap.release()
+                    if ok: res = cv2.cvtColor(fr, cv2.COLOR_BGR2RGB); break
+                raise RuntimeError("LivePortrait finished but no picture was written.\n" + last)
+            res = np.array(Image.open(max(pics, key=os.path.getmtime)).convert("RGB")); break
+        if "unrecognized" not in last.lower() and "unknown" not in last.lower(): raise RuntimeError("LivePortrait failed:\n" + last)
+    else:
+        raise RuntimeError("LivePortrait failed:\n" + last)
+    shutil.rmtree(work, ignore_errors=True)
+    if res.shape[:2] != rgb.shape[:2]: res = cv2.resize(res, (rgb.shape[1], rgb.shape[0]), interpolation=cv2.INTER_CUBIC)
+    return res
+
 def feature_guard(mask, fi):
     """take eyes / brows / lips / nostrils out of the skin mask so retouch never smears them"""
     if fi is None: return mask
@@ -4033,6 +4078,33 @@ class EditMixin:
             self.detect_face_async(silent=True, banner=False)
         self._bg_op("Straightening head...", fn, apply)
 
+    def m_ai_straighten(self):
+        """AI model (LivePortrait): crooked / turned / bent pose -> straight, front-facing"""
+        if not self.need_img(): return
+        d = SETTINGS.get("lp_dir", "")
+        if not liveportrait_ok(d):
+            QMessageBox.information(self, "AI Straighten (LivePortrait)", LP_SETUP)
+            d = QFileDialog.getExistingDirectory(self, "Choose the LivePortrait folder (contains inference.py)", d or "")
+            if not d: return
+            if not liveportrait_ok(d): return QMessageBox.warning(self, "LivePortrait", "inference.py or the 'pretrained_weights' folder was not found in:\n%s\n\nFinish the install steps first." % d)
+            SETTINGS["lp_dir"] = d; save_settings()
+        ref = SETTINGS.get("lp_ref", "")
+        if not ref or not os.path.isfile(ref):
+            QMessageBox.information(self, "Reference photo", "Choose ONE straight, front-facing photo (any person, mouth closed, looking at the camera).\nThe AI copies only its head pose; the face stays the customer's. It is remembered for next time.")
+            ref, _ = QFileDialog.getOpenFileName(self, "Straight front-facing reference photo", SETTINGS.get("last_dir", ""), "Images (*.jpg *.jpeg *.png)")
+            if not ref: return
+            SETTINGS["lp_ref"] = ref; save_settings()
+        arr = np.array(self.rgb); py = SETTINGS.get("lp_python") or sys.executable; had_alpha = self.alpha is not None
+        def fn(ctx): return run_liveportrait_straight(arr, SETTINGS["lp_dir"], SETTINGS["lp_ref"], py, ctx)
+        def apply(r):
+            self.finfo = None; self.face = None; self.hair_mask = None
+            self._done_rgb(r, "AI pose straightened" + ("  (background mask kept - run it BEFORE Remove Background for best edges)" if had_alpha else ""))
+            self.detect_face_async(silent=True, banner=False)
+        self._bg_op("AI is straightening the pose...", fn, apply)
+
+    def m_lp_reset(self):
+        SETTINGS["lp_dir"] = ""; SETTINGS["lp_ref"] = ""; save_settings(); self.status_msg("LivePortrait folder / reference cleared - choose again on next use")
+
     # ---------- AI agents ----------
     def agent_doctor(self):
         """AI Photo Doctor: finds what is wrong (colour cast, dark, noise, soft, red-eye) and fixes only that"""
@@ -5221,7 +5293,8 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         l.addWidget(group("BRIGHTNESS / CONTRAST / COLOR  (final photo)", [QLabel("Brightness"), self.s_bright, QLabel("Contrast"), self.s_contrast, self.c_bw,
                                                                          QLabel("Enhance strength"), self.s_enh, btn("Photo Enhance PRO", self.m_enhance)]))
         l.addWidget(group("PHOTO FIX TOOLS", [row(btn("Fix Colour Cast", self.m_awb), btn("Fix Dark / Backlight", self.m_lift_shadows)), row(btn("Reduce Noise", self.m_denoise), btn("Sharpen", self.m_sharpen_photo)),
-                                             btn("Red-Eye Fix", self.m_redeye), btn("↕ Straighten Head / Pose", self.m_straighten, BTN_ORANGE, "Tilted head or bent neck: eyes become level. Best after Remove Background"), btn("🩺 Photo Doctor (all in one)", self.agent_doctor, BTN_BLUE)]))
+                                             btn("Red-Eye Fix", self.m_redeye), btn("↕ Straighten Head / Pose", self.m_straighten, BTN_ORANGE, "Tilted head or bent neck: eyes become level. Best after Remove Background"),
+                                             btn("🤖 AI Straighten Pose (LivePortrait)", self.m_ai_straighten, BTN_PURPLE, "Real AI model: turned / crooked / bent pose -> straight. Needs LivePortrait installed (one time)", 40), btn("🩺 Photo Doctor (all in one)", self.agent_doctor, BTN_BLUE)]))
         l.addWidget(group("SKIN RETOUCH", [QLabel("Retouch / smooth strength"), self.s_smooth, row(btn("Skin Retouch (natural)", self.m_retouch), btn("Skin Smooth (soft)", self.m_smooth)),
                                            QLabel("Skin tone strength"), self.s_tone, btn("Skin Tone Up", self.m_tone), btn("Reduce oily shine", self.m_shine),
                                            btn("Pimple / Spot Heal (click)", self.m_pimple)]))
@@ -5300,7 +5373,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         m = mb.addMenu("&AI Tools")
         add(m, "AI Visa Photo", self.ai_visa); add(m, "AI ID Photo", self.ai_id); add(m, "⚡ Auto Fix", self.fix_clicked, "F9"); m.addSeparator()
         add(m, "🤖 Smart Agent (photo or document?)", self.agent_smart, "F10"); add(m, "🩺 Photo Doctor", self.agent_doctor, "Ctrl+Shift+H"); add(m, "Fix Colour Cast", self.m_awb); add(m, "Fix Dark / Backlight", self.m_lift_shadows)
-        add(m, "Reduce Noise", self.m_denoise); add(m, "Sharpen", self.m_sharpen_photo); add(m, "Red-Eye Fix", self.m_redeye); add(m, "↕ Straighten Head / Pose", self.m_straighten); m.addSeparator()
+        add(m, "Reduce Noise", self.m_denoise); add(m, "Sharpen", self.m_sharpen_photo); add(m, "Red-Eye Fix", self.m_redeye); add(m, "↕ Straighten Head / Pose", self.m_straighten); add(m, "🤖 AI Straighten Pose (LivePortrait)", self.m_ai_straighten); add(m, "Reset LivePortrait folder / reference", self.m_lp_reset); m.addSeparator()
         add(m, "AUTO CHALAO (checklist)", self.run_auto, "F5"); add(m, "Face Auto Detect", self.m_face_detect, "F7"); add(m, "Face Manual (box)", self.m_face_manual, "F8"); m.addSeparator()
         add(m, "Photo Enhance PRO", self.m_enhance); add(m, "Auto Enhance", self.m_auto_enhance); add(m, "AI Face Restore", self.m_face_ai); add(m, "AI Upscale 2x", self.m_upscale); m.addSeparator()
         add(m, "Skin Retouch (natural)", self.m_retouch); add(m, "Skin Smooth (soft)", self.m_smooth); add(m, "Skin Tone Up", self.m_tone); add(m, "Reduce oily shine", self.m_shine)
