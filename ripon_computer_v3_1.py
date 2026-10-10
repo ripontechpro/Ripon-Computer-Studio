@@ -929,6 +929,29 @@ def smart_classify(rgb, fi):
     if fi is not None: return "portrait", "Face found - passport / ID photo"
     return "unknown", "No face and no clear document edge found"
 
+# ---------------------------------------------------------------------
+#  STRAIGHTEN POSE  (tilted head / bent neck -> upright, eyes level)
+# ---------------------------------------------------------------------
+def straighten_pose(rgb, alpha, fi, strength=1.0):
+    """Rotate the HEAD about the neck so the eye line becomes horizontal; shoulders stay as they are.
+    alpha (float 0..1, same size) present -> only head + neck move (background is replaced later anyway).
+    No alpha -> the whole photo is levelled instead.  Returns (rgb, alpha, angle_applied)."""
+    ang = float(fi["angle"]) * float(strength)
+    if abs(ang) < 0.4: return rgb, alpha, 0.0
+    H, W = rgb.shape[:2]; x, y, w, h = fi["bbox"]; cx, cy = fi["chin"]
+    if alpha is None:
+        M = cv2.getRotationMatrix2D((x + w / 2, y + h / 2), ang, 1.0)
+        return cv2.warpAffine(rgb, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE), None, ang
+    pivot = (float(cx), float(cy) + 0.30 * h)                      # where the neck meets the shoulders
+    M = cv2.getRotationMatrix2D(pivot, ang, 1.0)
+    r2 = cv2.warpAffine(rgb, M, (W, H), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_REPLICATE)
+    a2 = cv2.warpAffine(alpha.astype(np.float32), M, (W, H), flags=cv2.INTER_LINEAR, borderValue=0)
+    yy = np.arange(H, dtype=np.float32)[:, None]; wgt = np.clip((pivot[1] - yy) / (0.28 * h), 0, 1); wgt = wgt * wgt * (3 - 2 * wgt)   # head=1, shoulders=0, smooth neck
+    wgt = np.repeat(wgt, W, 1)
+    out = (r2.astype(np.float32) * wgt[..., None] + rgb.astype(np.float32) * (1 - wgt[..., None])).astype(np.uint8)
+    a = np.clip(a2 * wgt + alpha * (1 - wgt), 0, 1).astype(np.float32)
+    return out, a, ang
+
 def feature_guard(mask, fi):
     """take eyes / brows / lips / nostrils out of the skin mask so retouch never smears them"""
     if fi is None: return mask
@@ -3996,6 +4019,20 @@ class EditMixin:
             out, n = fix_red_eye(arr, fi); box["n"] = n; return out
         self._bg_op("Fixing red eyes...", fn, lambda r: self._done_rgb(r, "Red-eye fixed" if box.get("n") else "No red-eye found"))
 
+    def m_straighten(self):
+        """tilted head / bent neck -> eyes level (head rotates about the neck, shoulders stay)"""
+        if not self._need_face(self.m_straighten): return
+        arr, fi, al = np.array(self.rgb), self.finfo, self.alpha_np(); box = {}
+        if fi is None or abs(fi.get("angle", 0)) < 0.4:
+            return self.banner.done("Head is already straight")
+        def fn(ctx): r, a, ang = straighten_pose(arr, al, fi); box["a"] = a; box["ang"] = ang; return r
+        def apply(r):
+            if box["a"] is not None: self.alpha = Image.fromarray((np.clip(box["a"], 0, 1) * 255).astype(np.uint8))
+            self.finfo = None; self.face = None; self.hair_mask = None
+            self._done_rgb(r, "Head straightened (%.1f°)%s" % (abs(box["ang"]), "" if box["a"] is not None else " - whole photo rotated; use Remove Background first to move only the head"))
+            self.detect_face_async(silent=True, banner=False)
+        self._bg_op("Straightening head...", fn, apply)
+
     # ---------- AI agents ----------
     def agent_doctor(self):
         """AI Photo Doctor: finds what is wrong (colour cast, dark, noise, soft, red-eye) and fixes only that"""
@@ -5184,7 +5221,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         l.addWidget(group("BRIGHTNESS / CONTRAST / COLOR  (final photo)", [QLabel("Brightness"), self.s_bright, QLabel("Contrast"), self.s_contrast, self.c_bw,
                                                                          QLabel("Enhance strength"), self.s_enh, btn("Photo Enhance PRO", self.m_enhance)]))
         l.addWidget(group("PHOTO FIX TOOLS", [row(btn("Fix Colour Cast", self.m_awb), btn("Fix Dark / Backlight", self.m_lift_shadows)), row(btn("Reduce Noise", self.m_denoise), btn("Sharpen", self.m_sharpen_photo)),
-                                             btn("Red-Eye Fix", self.m_redeye), btn("🩺 Photo Doctor (all in one)", self.agent_doctor, BTN_BLUE)]))
+                                             btn("Red-Eye Fix", self.m_redeye), btn("↕ Straighten Head / Pose", self.m_straighten, BTN_ORANGE, "Tilted head or bent neck: eyes become level. Best after Remove Background"), btn("🩺 Photo Doctor (all in one)", self.agent_doctor, BTN_BLUE)]))
         l.addWidget(group("SKIN RETOUCH", [QLabel("Retouch / smooth strength"), self.s_smooth, row(btn("Skin Retouch (natural)", self.m_retouch), btn("Skin Smooth (soft)", self.m_smooth)),
                                            QLabel("Skin tone strength"), self.s_tone, btn("Skin Tone Up", self.m_tone), btn("Reduce oily shine", self.m_shine),
                                            btn("Pimple / Spot Heal (click)", self.m_pimple)]))
@@ -5263,7 +5300,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         m = mb.addMenu("&AI Tools")
         add(m, "AI Visa Photo", self.ai_visa); add(m, "AI ID Photo", self.ai_id); add(m, "⚡ Auto Fix", self.fix_clicked, "F9"); m.addSeparator()
         add(m, "🤖 Smart Agent (photo or document?)", self.agent_smart, "F10"); add(m, "🩺 Photo Doctor", self.agent_doctor, "Ctrl+Shift+H"); add(m, "Fix Colour Cast", self.m_awb); add(m, "Fix Dark / Backlight", self.m_lift_shadows)
-        add(m, "Reduce Noise", self.m_denoise); add(m, "Sharpen", self.m_sharpen_photo); add(m, "Red-Eye Fix", self.m_redeye); m.addSeparator()
+        add(m, "Reduce Noise", self.m_denoise); add(m, "Sharpen", self.m_sharpen_photo); add(m, "Red-Eye Fix", self.m_redeye); add(m, "↕ Straighten Head / Pose", self.m_straighten); m.addSeparator()
         add(m, "AUTO CHALAO (checklist)", self.run_auto, "F5"); add(m, "Face Auto Detect", self.m_face_detect, "F7"); add(m, "Face Manual (box)", self.m_face_manual, "F8"); m.addSeparator()
         add(m, "Photo Enhance PRO", self.m_enhance); add(m, "Auto Enhance", self.m_auto_enhance); add(m, "AI Face Restore", self.m_face_ai); add(m, "AI Upscale 2x", self.m_upscale); m.addSeparator()
         add(m, "Skin Retouch (natural)", self.m_retouch); add(m, "Skin Smooth (soft)", self.m_smooth); add(m, "Skin Tone Up", self.m_tone); add(m, "Reduce oily shine", self.m_shine)
