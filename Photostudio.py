@@ -6,11 +6,17 @@
 #  Run:      python ripon_computer_v3.py
 #  Required: pip install PySide6 opencv-python numpy pillow rembg onnxruntime
 #  Optional AI (everything works without these, just with simpler tools):
+#      GPU on ANY Windows GPU (no CUDA needed): pip uninstall onnxruntime && pip install onnxruntime-directml
+#      FAST AI upscale (no torch, no CUDA): 'AI Models' -> download 'Real-ESRGAN ncnn Vulkan' (NVIDIA / AMD / Intel GPU)
 #      GPU background removal : pip uninstall onnxruntime && pip install onnxruntime-gpu
 #      Face detect/landmarks  : pip install insightface
 #      Face restore / upscale : pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 #                               pip install gfpgan realesrgan basicsr
+#  AI STUDIO (upscale / face restore / object removal / cutout / old photo ...): keep ripon_ai_studio.py NEXT TO this file.
+#      Needs only onnxruntime(-gpu) for CodeFormer / LaMa / MODNet - no torch. Menu: AI Tools > AI Studio (Ctrl+Shift+I).
 #  Models are stored in:   %LOCALAPPDATA%\RiponComputer\models   (see "AI Models" button)
+#  LAYOUT STUDIO (multi-image / multi-page editor, Bank Photo Duet, ID card, print): keep ripon_layout_studio.py, ripon_core.py,
+#      ripon_studio_base.py, ripon_studio_tools.py, ripon_studio_panels.py NEXT TO this file.  Menu: Studio > Layout Studio (Ctrl+Shift+L).
 #  Dress/Suit PNG: put transparent PNGs in the "dress" folder next to this file.
 #                  Sub-folders Shirt / Suit / Tie / Coat become tabs automatically.
 # =====================================================================
@@ -210,12 +216,33 @@ MODEL_REGISTRY = collections.OrderedDict([
                         file=os.path.join("realesrgan", "RealESRGAN_x4plus.pth"),
                         url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth",
                         note="Only for small photos. Needs torch + realesrgan.")),
+    ("esrgan_ncnn", dict(label="FAST AI Upscale (Real-ESRGAN ncnn Vulkan)", size="~45 MB", kind="zip",
+                         file=os.path.join("realesrgan-ncnn", "realesrgan-ncnn-vulkan.exe"),
+                         url="https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip",
+                         note="Fastest. No torch / CUDA / Python package needed - runs on any NVIDIA, AMD or Intel GPU (Windows).")),
+    ("gfpgan_onnx", dict(label="Face Restore FAST (GFPGAN ONNX)", size="~340 MB", kind="file",
+                         file=os.path.join("gfpgan", "gfpgan_1.4.onnx"),
+                         url="https://github.com/facefusion/facefusion-assets/releases/download/models/gfpgan_1.4.onnx",
+                         note="Face restore without torch. Uses onnxruntime (GPU with onnxruntime-directml / -gpu).")),
+    ("isnet-general-use", dict(label="Background Remove: Fast general (ISNet)", size="~170 MB", kind="rembg",
+                               note="Fast and sharp edges. Good for clothes + hair.")),
+    ("birefnet-general-lite", dict(label="Background Remove: BiRefNet lite", size="~200 MB", kind="rembg",
+                                   note="Good hair edges, lighter than BiRefNet portrait.")),
+    ("silueta", dict(label="Background Remove: Tiny / very fast (Silueta)", size="~43 MB", kind="rembg",
+                     note="Smallest background model. Use on slow PCs.")),
+    ("u2net_cloth_seg", dict(label="Dress AI: clothes finder (U2Net cloth)", size="~170 MB", kind="rembg",
+                             note="Used by 'AI Dress Fit' to find the old shirt, then dress it with a suit / shirt / tie PNG.")),
 ])
-BG_MODEL_KEYS = ["u2net_human_seg", "birefnet-portrait", "bria-rmbg"]
+BG_MODEL_KEYS = ["u2net_human_seg", "birefnet-portrait", "bria-rmbg", "isnet-general-use", "birefnet-general-lite", "silueta"]
+UPSCALE_KEYS = ["esrgan_ncnn", "realesrgan"]
+RESTORE_KEYS = ["gfpgan_onnx", "gfpgan"]
 MODELS = {   # v2 names -> rembg ids (kept so old code/menus still work)
     "u2net_human_seg (fast, halka)": "u2net_human_seg",
     "birefnet-portrait (chul e best)": "birefnet-portrait",
     "bria-rmbg (RMBG-2.0)": "bria-rmbg",
+    "isnet-general-use (fast, sharp)": "isnet-general-use",
+    "birefnet-general-lite (hair, light)": "birefnet-general-lite",
+    "silueta (tiny, very fast)": "silueta",
 }
 
 class Cancelled(Exception):
@@ -236,12 +263,14 @@ class ModelHub:
     # ---------- device ----------
     def device_info(self, refresh=False):
         if self._dev is not None and not refresh: return self._dev
-        d = dict(cuda=False, gpu="", torch=False, ort_gpu=False, providers=["CPUExecutionProvider"])
+        d = dict(cuda=False, gpu="", torch=False, ort_gpu=False, ort_dml=False, providers=["CPUExecutionProvider"])
         try:
             import onnxruntime as ort
             av = ort.get_available_providers()
             d["ort_gpu"] = "CUDAExecutionProvider" in av
+            d["ort_dml"] = "DmlExecutionProvider" in av
             if d["ort_gpu"]: d["providers"] = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            elif d["ort_dml"]: d["providers"] = ["DmlExecutionProvider", "CPUExecutionProvider"]
         except Exception:
             pass
         try:
@@ -260,16 +289,25 @@ class ModelHub:
     def torch_device(self):
         return "cuda" if (self.use_gpu() and self.device_info()["cuda"]) else "cpu"
 
+    def ort_gpu_any(self):
+        d = self.device_info(); return bool(self.use_gpu() and (d["ort_gpu"] or d["ort_dml"]))
+
     def ort_providers(self):
-        return self.device_info()["providers"] if (self.use_gpu() and self.device_info()["ort_gpu"]) else ["CPUExecutionProvider"]
+        return self.device_info()["providers"] if self.ort_gpu_any() else ["CPUExecutionProvider"]
 
     # ---------- install state ----------
     def path_of(self, key):
         r = MODEL_REGISTRY[key]
+        if r["kind"] == "zip":
+            exp = os.path.join(MODELS_DIR, r["file"])
+            if os.path.isfile(exp): return exp
+            hits = glob.glob(os.path.join(os.path.dirname(exp), "**", os.path.basename(exp)), recursive=True)
+            return hits[0] if hits else exp
         return os.path.join(MODELS_DIR, r["file"]) if r["kind"] == "file" else None
 
     def is_installed(self, key):
         r = MODEL_REGISTRY[key]
+        if r["kind"] == "zip": return os.path.isfile(self.path_of(key))
         if r["kind"] == "file": return os.path.isfile(self.path_of(key)) and os.path.getsize(self.path_of(key)) > 1000
         if r["kind"] == "rembg": return os.path.isfile(os.path.join(os.environ["U2NET_HOME"], key + ".onnx"))
         if r["kind"] == "insightface":
@@ -284,6 +322,8 @@ class ModelHub:
         if key == "gfpgan": need = ["torch", "gfpgan"]
         if key == "realesrgan": need = ["torch", "realesrgan", "basicsr"]
         if key == "yunet": return hasattr(cv2, "FaceDetectorYN")
+        if key == "gfpgan_onnx": need = ["onnxruntime"]
+        if r["kind"] == "zip": return sys.platform == "win32"
         try: return all(iu.find_spec(n) is not None for n in need)
         except Exception: return False
 
@@ -307,9 +347,10 @@ class ModelHub:
     def download(self, key, progress=None):
         """progress(msg, frac_or_None). Raises on failure."""
         r = MODEL_REGISTRY[key]
-        if r["kind"] == "file":
+        if r["kind"] in ("file", "zip"):
+            dest = self.path_of(key) if r["kind"] == "file" else os.path.join(MODELS_DIR, key + ".zip")
             os.makedirs(os.path.dirname(self.path_of(key)), exist_ok=True)
-            tmp = self.path_of(key) + ".part"
+            tmp = dest + ".part"
             req = urllib.request.Request(r["url"], headers={"User-Agent": "RiponComputer/3"})
             with urllib.request.urlopen(req, timeout=30) as resp, open(tmp, "wb") as out:
                 total = int(resp.headers.get("Content-Length") or 0); got = 0
@@ -318,7 +359,14 @@ class ModelHub:
                     if not chunk: break
                     out.write(chunk); got += len(chunk)
                     if progress: progress("Downloading %s ..." % r["label"], (got / total) if total else None)
-            os.replace(tmp, self.path_of(key))
+            os.replace(tmp, dest)
+            if r["kind"] == "zip":
+                import zipfile
+                if progress: progress("Unpacking %s ..." % r["label"], None)
+                with zipfile.ZipFile(dest) as zf: zf.extractall(os.path.dirname(os.path.join(MODELS_DIR, r["file"])))
+                try: os.remove(dest)
+                except OSError: pass
+                if not os.path.isfile(self.path_of(key)): raise RuntimeError("Downloaded package does not contain the program file")
         elif r["kind"] == "rembg":
             if progress: progress("Downloading %s (no % available) ..." % r["label"], None)
             self._rembg_session(key, force_cpu=True, load_only=True)
@@ -370,8 +418,8 @@ class ModelHub:
             if name in self.cache and not force_cpu:
                 self.cache.move_to_end(name); return self.cache[name]
             from rembg import new_session
-            gpu = self.use_gpu() and self.device_info()["ort_gpu"] and not force_cpu
-            prov = ["CUDAExecutionProvider", "CPUExecutionProvider"] if gpu else ["CPUExecutionProvider"]
+            gpu = self.ort_gpu_any() and not force_cpu
+            prov = self.ort_providers() if gpu else ["CPUExecutionProvider"]
             try: sess = new_session(name, providers=prov)
             except TypeError: sess = new_session(name); gpu = False
             self._remember(name, sess, gpu)
@@ -402,6 +450,17 @@ class ModelHub:
                              pre_pad=0, half=(dev == "cuda"), gpu_id=0 if dev == "cuda" else None)
             self._remember("realesrgan", e, dev == "cuda")
             return e
+
+    def _onnx_sess(self, key, force_cpu=False):
+        with self.lock:
+            if key in self.cache and not force_cpu:
+                self.cache.move_to_end(key); return self.cache[key]
+            import onnxruntime as ort
+            gpu = self.ort_gpu_any() and not force_cpu
+            so = ort.SessionOptions(); so.log_severity_level = 3
+            sess = ort.InferenceSession(self.path_of(key), sess_options=so, providers=self.ort_providers() if gpu else ["CPUExecutionProvider"])
+            self._remember(key, sess, gpu)
+            return sess
 
     def warmup(self, bg_model, progress=None):
         """load only what is already installed; never downloads"""
@@ -442,7 +501,59 @@ class ModelHub:
         if a.shape != (H, W): a = cv2.resize(a, (W, H), interpolation=cv2.INTER_CUBIC)
         return np.clip(a, 0, 1)
 
-    def restore_face(self, rgb, weight=0.5):
+    _FFHQ5 = np.array([[192.98138, 239.94708], [318.90277, 240.1936], [256.63416, 314.01935],
+                       [201.26117, 371.41043], [313.08905, 371.15118]], np.float32)
+
+    def can_restore(self):
+        return any(self.is_installed(k) and self.lib_available(k) for k in RESTORE_KEYS)
+
+    def _restore_onnx(self, rgb, weight, fi):
+        """GFPGAN 1.4 through onnxruntime (no torch). Aligns the face with the 5 landmarks, restores, blends back softly."""
+        if fi is None: fi = detect_face_info(rgb, self)
+        if fi is None: raise RuntimeError("Face not found for restore")
+        src = np.array([fi["le"], fi["re"], fi["nose"], fi["ml"], fi["mr"]], np.float32)
+        M, _ = cv2.estimateAffinePartial2D(src, self._FFHQ5, method=cv2.LMEDS)
+        if M is None: raise RuntimeError("Could not align the face")
+        H, W = rgb.shape[:2]
+        crop = cv2.warpAffine(rgb, M, (512, 512), flags=cv2.INTER_AREA, borderMode=cv2.BORDER_REPLICATE)
+        x = ((crop.astype(np.float32) / 255.0 - 0.5) / 0.5).transpose(2, 0, 1)[None].astype(np.float32)
+        sess = self._onnx_sess("gfpgan_onnx")
+        try:
+            out = sess.run(None, {sess.get_inputs()[0].name: x})[0]
+        except Exception as e:
+            if getattr(sess, "_ripon_gpu", False) or self.ort_gpu_any():
+                self.notes.append("GPU face restore failed, used CPU (%s)" % (str(e).splitlines() or [""])[0][:50])
+                self.unload("gfpgan_onnx"); sess = self._onnx_sess("gfpgan_onnx", force_cpu=True)
+                out = sess.run(None, {sess.get_inputs()[0].name: x})[0]
+            else: raise
+        out = np.clip(out[0].transpose(1, 2, 0), -1, 1); out = ((out + 1) * 127.5).astype(np.uint8)
+        Mi = cv2.invertAffineTransform(M)
+        back = cv2.warpAffine(out, Mi, (W, H), flags=cv2.INTER_LINEAR)
+        mk = np.zeros((512, 512), np.float32); mk[36:476, 36:476] = 1.0; mk = cv2.GaussianBlur(mk, (0, 0), 22)
+        m = cv2.warpAffine(mk, Mi, (W, H), flags=cv2.INTER_LINEAR)[..., None] * float(np.clip(weight * 1.4, 0.15, 1.0))
+        return np.clip(rgb.astype(np.float32) * (1 - m) + back.astype(np.float32) * m, 0, 255).astype(np.uint8)
+
+    def cloth_mask(self, rgb, max_side=768):
+        """float 0..1 mask of the clothes (upper body + full) from u2net_cloth_seg. rembg stacks its 3 masks vertically."""
+        from rembg import remove
+        H, W = rgb.shape[:2]; k = min(1.0, max_side / float(max(H, W)))
+        small = cv2.resize(rgb, (max(1, int(W * k)), max(1, int(H * k))), interpolation=cv2.INTER_AREA) if k < 1 else rgb
+        sh = small.shape[0]
+        m = remove(Image.fromarray(small), session=self._rembg_session("u2net_cloth_seg"), only_mask=True).convert("L")
+        a = np.array(m, np.float32) / 255.0
+        if a.shape[0] >= 2 * sh:
+            n = max(1, a.shape[0] // sh); a = np.max([a[i * sh:(i + 1) * sh] for i in range(n)], axis=0)
+        a = cv2.resize(a, (W, H), interpolation=cv2.INTER_LINEAR)
+        return np.clip(a, 0, 1)
+
+    def restore_face(self, rgb, weight=0.5, fi=None, engine=None):
+        if engine == "gfpgan_onnx":
+            return self._restore_onnx(rgb, weight, fi)
+        if engine is None and self.is_installed("gfpgan_onnx") and self.lib_available("gfpgan_onnx"):
+            try: return self._restore_onnx(rgb, weight, fi)
+            except Exception as e:
+                self.notes.append("ONNX face restore failed (%s)" % (str(e).splitlines() or [""])[0][:50]); log.warning("restore onnx: %s", e)
+                if not (self.is_installed("gfpgan") and self.lib_available("gfpgan")): raise
         try:
             g = self._gfpgan()
             bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
@@ -459,16 +570,49 @@ class ModelHub:
         if out is None: raise RuntimeError("Face not found for restore")
         return cv2.cvtColor(out, cv2.COLOR_BGR2RGB)
 
-    def upscale(self, pil_img, outscale=2):
-        """Real-ESRGAN when installed, otherwise Lanczos + sharpen. returns (PIL, how)"""
-        if self.is_installed("realesrgan") and self.lib_available("realesrgan"):
-            try:
-                e = self._esrgan()
-                out, _ = e.enhance(cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR), outscale=outscale)
-                return Image.fromarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB)), "AI (Real-ESRGAN)"
-            except Exception as ex:
-                self.notes.append("AI Upscale unavailable, used normal upscale (%s)" % (str(ex).splitlines() or [""])[0][:50])
-                log.warning("esrgan fail: %s", ex)
+    def _upscale_ncnn(self, pil_img, scale, hq=False):
+        """Real-ESRGAN ncnn Vulkan portable exe: runs on any GPU, no torch / CUDA. hq = x4plus model (best, slower)."""
+        import tempfile
+        exe = self.path_of("esrgan_ncnn"); mdir = os.path.join(os.path.dirname(exe), "models")
+        model = "realesrgan-x4plus" if hq else "realesr-animevideov3"
+        if not os.path.isfile(os.path.join(mdir, model + ".bin")): model = "realesrgan-x4plus"
+        if max(pil_img.size) * 4 > 9000 and model == "realesrgan-x4plus": raise RuntimeError("photo too large for the best-quality model")
+        s = 4 if model == "realesrgan-x4plus" else int(scale)
+        tmp = tempfile.mkdtemp(prefix="ripon_up_")
+        try:
+            src, dst = os.path.join(tmp, "in.png"), os.path.join(tmp, "out.png")
+            pil_img.convert("RGB").save(src, "PNG", compress_level=1)
+            cmd = [exe, "-i", src, "-o", dst, "-n", model, "-s", str(s), "-f", "png", "-m", mdir]
+            if not self.use_gpu(): cmd += ["-g", "-1"]
+            flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            p = subprocess.run(cmd, capture_output=True, timeout=900, creationflags=flags, cwd=os.path.dirname(exe))
+            if p.returncode != 0 or not os.path.isfile(dst):
+                raise RuntimeError("ncnn upscaler failed: " + (p.stderr or b"").decode("utf-8", "ignore")[-160:])
+            out = Image.open(dst).convert("RGB"); out.load()
+            tw, th = pil_img.width * scale, pil_img.height * scale
+            if out.size != (tw, th): out = out.resize((tw, th), Image.LANCZOS)
+            return out
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+    def upscale(self, pil_img, outscale=2, engine=None):
+        """engine: None (auto: fastest installed) | 'esrgan_ncnn' | 'esrgan_ncnn_hq' | 'realesrgan' (torch). returns (PIL, how)"""
+        order = [engine] if engine else ["esrgan_ncnn", "realesrgan"]
+        for eng in order:
+            if eng in ("esrgan_ncnn", "esrgan_ncnn_hq") and self.is_installed("esrgan_ncnn") and self.lib_available("esrgan_ncnn"):
+                try:
+                    hq = eng == "esrgan_ncnn_hq"
+                    return self._upscale_ncnn(pil_img, outscale, hq), "AI GPU (Real-ESRGAN ncnn%s)" % (" best quality" if hq else " fast")
+                except Exception as ex:
+                    self.notes.append("Fast AI upscale failed (%s)" % (str(ex).splitlines() or [""])[0][:60]); log.warning("ncnn fail: %s", ex)
+            elif eng == "realesrgan" and self.is_installed("realesrgan") and self.lib_available("realesrgan"):
+                try:
+                    e = self._esrgan()
+                    out, _ = e.enhance(cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR), outscale=outscale)
+                    return Image.fromarray(cv2.cvtColor(out, cv2.COLOR_BGR2RGB)), "AI (Real-ESRGAN torch)"
+                except Exception as ex:
+                    self.notes.append("AI Upscale unavailable, used normal upscale (%s)" % (str(ex).splitlines() or [""])[0][:50])
+                    log.warning("esrgan fail: %s", ex)
         big = pil_img.resize((pil_img.width * outscale, pil_img.height * outscale), Image.LANCZOS)
         a = np.array(big)
         a = cv2.addWeighted(a, 1.5, cv2.GaussianBlur(a, (0, 0), 1.6), -0.5, 0)
@@ -482,10 +626,10 @@ def remove_bg(pil_img, model="u2net_human_seg"):
     out = pil_img.convert("RGBA"); out.putalpha(Image.fromarray((a * 255).astype(np.uint8)))
     return out
 
-def ai_face_restore(rgb, weight=0.5):
-    if not HUB.is_installed("gfpgan") or not HUB.lib_available("gfpgan"):
-        raise RuntimeError("AI Face Restore is not installed.\nOpen 'AI Models' and press Download for GFPGAN (needs: pip install torch gfpgan).")
-    return HUB.restore_face(rgb, weight)
+def ai_face_restore(rgb, weight=0.5, fi=None):
+    if not HUB.can_restore():
+        raise RuntimeError("AI Face Restore is not installed.\nOpen 'AI Models' and download 'Face Restore FAST (GFPGAN ONNX)'.")
+    return HUB.restore_face(rgb, weight, fi)
 
 def upscale2x(pil_img):
     return HUB.upscale(pil_img, 2)
@@ -1355,13 +1499,28 @@ def crop_to(cut, bg, size_mm, box):
     return canvas.resize((pw, ph), Image.LANCZOS)
 
 
-def add_dress(im, dress, scale, yoff, xoff=0):
-    """dress = transparent PNG (RGBA). scale = photo width %, yoff = up/down (% of height), xoff = left/right (% of width)"""
-    W, H = im.size
+def dress_layer(size, dress, scale, yoff, xoff=0):
+    """transparent RGBA layer (photo size) holding the dress at the requested size / position"""
+    W, H = size
     dw = max(1, int(W * scale / 100.0)); dh = max(1, int(dress.height * dw / dress.width))
     d = dress.resize((dw, dh), Image.LANCZOS)
-    out = im.convert("RGBA")
-    out.paste(d, ((W - dw) // 2 + int(W * xoff / 100.0), H - dh + int(H * yoff / 100.0)), d)
+    lay = Image.new("RGBA", (W, H), (0, 0, 0, 0))
+    lay.paste(d, ((W - dw) // 2 + int(W * xoff / 100.0), H - dh + int(H * yoff / 100.0)), d)
+    return lay
+
+def add_dress(im, dress, scale, yoff, xoff=0, cloth=None, bg=(255, 255, 255)):
+    """dress = transparent PNG (RGBA). scale = photo width %, yoff = up/down (% of height), xoff = left/right (% of width).
+    cloth = optional PIL 'L' mask of the OLD clothes (AI Dress Fit): old clothes that the new dress does not cover are painted out."""
+    lay = dress_layer(im.size, dress, scale, yoff, xoff)
+    out = im.convert("RGB")
+    if cloth is not None and cloth.size == out.size:
+        cm = np.array(cloth, np.float32) / 255.0
+        cov = np.array(lay.getchannel("A"), np.float32) / 255.0
+        un = np.clip(cm * (1.0 - cov), 0, 1)
+        un = cv2.GaussianBlur(un, (0, 0), 1.2)[..., None]
+        arr = np.array(out, np.float32) * (1 - un) + np.array(bg, np.float32) * un
+        out = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8))
+    out = out.convert("RGBA"); out.alpha_composite(lay)
     return out.convert("RGB")
 
 # =====================================================================
@@ -1952,7 +2111,9 @@ def run_ai_pipeline(img, preset, opts, ctx, hub=None):
     # ---- 3. background ----
     alpha = None; used_model = None
     stage(2)
-    if opts.get("bg", True):
+    if opts.get("alpha") is not None:
+        alpha = np.clip(np.asarray(opts["alpha"], np.float32)[y0:y1, x0:x1] / 255.0, 0, 1); used_model = "existing mask"
+    elif opts.get("bg", True):
         chain = [opts.get("model") or "u2net_human_seg"]
         if chain[0] != "u2net_human_seg": chain.append("u2net_human_seg")
         for mdl in chain:
@@ -1983,9 +2144,9 @@ def run_ai_pipeline(img, preset, opts, ctx, hub=None):
         face_blur = stats.get("face_blur", 999)
         need_restore = (want_restore is True) or (want_restore == "auto" and (face_blur < 45 or ratio_up > 1.6))
         if need_restore:
-            if hub.is_installed("gfpgan") and hub.lib_available("gfpgan"):
+            if hub.can_restore():
                 try:
-                    ctx.check(); res = hub.restore_face(arr, 0.45)
+                    ctx.check(); res = hub.restore_face(arr, 0.45, fi)
                     arr = np.clip(res.astype(np.float32) * 0.8 + arr.astype(np.float32) * 0.2, 0, 255).astype(np.uint8)
                 except Cancelled: raise
                 except Exception as e:
@@ -2960,7 +3121,7 @@ class FacePickView(QWidget):
 
     def mouseReleaseEvent(self, e): self._mode = None
 
-def run_auto_pipeline(arr, face, settings, model_name, hair_rgb):
+def run_auto_pipeline(arr, face, settings, model_name, hair_rgb, face_info=None):
     """Pure processing pipeline used by the worker. No Qt/UI access here."""
     notes = []
     arr = np.ascontiguousarray(arr)
@@ -2969,7 +3130,7 @@ def run_auto_pipeline(arr, face, settings, model_name, hair_rgb):
         arr = enhance_pro(arr, settings.get("enh_strength", 60))
     if settings.get("face_ai"):
         try:
-            arr = ai_face_restore(arr, settings.get("face_strength", 50) / 100.0)
+            arr = ai_face_restore(arr, settings.get("face_strength", 50) / 100.0, face_info)
         except Exception as e:
             notes.append("AI Face skipped: " + (str(e).splitlines() or [""])[0][:90])
     skin_on = settings.get("smooth") or settings.get("tone") or settings.get("shine")
@@ -3330,7 +3491,7 @@ class DocStudio(QDialog):
         side.addWidget(group("ID CARD / EXTRA", [btn("🪪 ID Front + Back → one A4 copy", self.id_sheet, "background:#1565c0;color:white;font-weight:bold;", "This page = front, next page = back. Real card size 85.6 x 54 mm", 38),
                                                  btn("Watermark all pages (e.g. COPY)...", self.watermark), btn("Duplicate page", self.dup_page)]))
         side.addWidget(group("5. OUTPUT (A4)", [self.c_a4, QLabel("PDF size"), self.pdf_q, btn("Save PDF (all pages)", self.save_pdf, "background:#2e7d32;color:white;font-weight:bold;"),
-                                                 btn("Save pages as JPG...", self.save_jpgs), btn("Print...", self.print_pages)]))
+                                                 btn("Save pages as JPG...", self.save_jpgs), btn("Print...", self.print_pages), btn("Send pages to Layout Studio (one page each)", self.send_layout)]))
         side.addStretch(); pan = QWidget(); pan.setLayout(side); sc = QScrollArea(); sc.setWidgetResizable(True); sc.setWidget(pan); sc.setFixedWidth(330)
         body = QHBoxLayout(); body.addWidget(self.list); body.addWidget(self.view, 1); body.addWidget(sc)
         lay = QVBoxLayout(self); lay.setContentsMargins(6, 6, 6, 6); lay.addWidget(self.banner); lay.addLayout(body)
@@ -3485,6 +3646,16 @@ class DocStudio(QDialog):
         p = self._page()
         if p is None: return
         q = dict(p); q["hist"] = []; self.pages.insert(self.cur + 1, q); self._rebuild(self.cur + 1)
+    def send_layout(self):
+        if not self.pages: return QMessageBox.information(self, "Layout Studio", "Add document pages first.")
+        try:
+            import ripon_layout_studio as _LS
+            w = _LS.open_studio(self.app); folder = os.path.join(APP_DIR, "layout_cache"); os.makedirs(folder, exist_ok=True); paths = []
+            for i, p in enumerate(self.pages):
+                fp = unique_path(os.path.join(folder, "doc_page_%02d.png" % (i + 1))); Image.fromarray(self._render(p)).save(fp, dpi=(300, 300)); paths.append(fp)
+            w.add_images_as_pages(paths)
+        except Exception as e:
+            log.error("send to Layout Studio failed: %s\n%s", e, traceback.format_exc()); QMessageBox.warning(self, "Layout Studio", "Could not send the pages:\n%s" % e)
     def id_sheet(self):
         p = self._page()
         if p is None: return QMessageBox.information(self, "ID Card", "Add the ID card photo(s) first. This page = FRONT, the next page = BACK.")
@@ -3650,6 +3821,7 @@ class CoreMixin:
 
     # ---------- undo / redo ----------
     def push(self):
+        self._edit_count += 1
         self.history.append(self._snap()); self.history = self.history[-12:]; self.redo_stack = []
 
     def _snap(self):
@@ -4159,34 +4331,35 @@ class EditMixin:
         if not self.need_img(): return
         self.open_retouch("heal")
 
-    def m_face_ai(self):
+    def m_face_ai(self, engine=None):
         if not self.need_img(): return
-        if not (HUB.is_installed("gfpgan") and HUB.lib_available("gfpgan")):
+        if not HUB.can_restore():
             if ask_yes_no(self, "AI Face Restore", "AI Face Restore is not available (not installed / not downloaded).\n\nContinue with normal enhancement instead?\n(Open 'AI Models' to install it.)"):
                 self.m_auto_enhance()
             return
-        arr, w = np.array(self.rgb), self.s_aiface.value() / 100.0
-        def fn(ctx): r = HUB.restore_face(arr, w); return r
+        arr, w, fi = np.array(self.rgb), self.s_aiface.value() / 100.0, self.finfo
+        def fn(ctx): r = HUB.restore_face(arr, w, fi, engine if isinstance(engine, str) else None); return r
         def apply(r):
             self._done_rgb(r, "AI Face Restore done")
             if HUB.notes: self.banner.warn(HUB.notes.pop()); HUB.notes.clear()
         self._bg_op("AI Face Restore...", fn, apply)
 
-    def m_upscale(self):
+    def m_upscale(self, engine=None):
+        """Upscale ONLY the working (edited) photo. The saved original (self.orig) is never touched, so edits keep their size and
+        'Original' / 'Reset' still show the real customer photo."""
         if not self.need_img(): return
+        engine = engine if isinstance(engine, str) else None
         if max(self.rgb.size) >= 2400: return self.status_msg("Photo is already large (2400px+), no upscale needed")
         im = self.rgb.copy(); old = self.rgb.size
         def apply(res):
             big, how = res; k = big.width / float(old[0])
-            if self.orig is not None and self.orig.size == old:
-                self.orig = self.orig.resize(big.size, Image.LANCZOS)
-                if self.fi_orig is not None: self.fi_orig = _scale_fi(self.fi_orig, k)
-            if self.alpha is not None: self.alpha = self.alpha.resize(big.size, Image.LANCZOS)
+            if self.alpha is not None: self.alpha = self.alpha.resize(big.size, Image.BICUBIC)
             self.set_rgb(big)
             if self.finfo is not None: self.finfo = _scale_fi(self.finfo, k); self.face = fi_face_tuple(self.finfo)
             if self.box is not None: self.box = [self.box[0] * k, self.box[1] * k, self.box[2] * k, self.box[3]]; self.base_h *= k
             self.hair_mask = None; self.after_change(); self.banner.done("Upscaled x2: " + how)
-        self._bg_op("Upscaling x2...", lambda ctx: HUB.upscale(im, 2), apply)
+            if HUB.notes: self.banner.warn(HUB.notes.pop()); HUB.notes.clear()
+        self._bg_op("Upscaling x2...", lambda ctx: HUB.upscale(im, 2, engine), apply)
 
     # ---------- hair colour ----------
     def hair_detect(self, then=None):
@@ -4297,6 +4470,7 @@ class EditMixin:
         try: self.dress = Image.open(p).convert("RGBA") if p else None
         except Exception as e: return QMessageBox.critical(self, "Dress", str(e))
         self.dress_path = p
+        if not p: self.cloth = None
         self.apply_adjust(); self.status_msg("Dress applied" if p else "Dress removed")
 
     def dress_files(self):
@@ -4407,7 +4581,9 @@ class EditMixin:
         if b: im = ImageEnhance.Brightness(im).enhance(1 + b / 100.0)
         if c: im = ImageEnhance.Contrast(im).enhance(1 + c / 100.0)
         if self.c_bw.isChecked(): im = ImageOps.grayscale(im).convert("RGB")
-        if self.dress is not None: im = add_dress(im, self.dress, self.s_dress.value(), self.s_dress_y.value(), self.s_dress_x.value())
+        if self.dress is not None:
+            cl = self.cloth[0] if (self.cloth is not None and self.box is not None and self.cloth[1] == tuple(round(v, 2) for v in self.box)) else None
+            im = add_dress(im, self.dress, self.s_dress.value(), self.s_dress_y.value(), self.s_dress_x.value(), cl, self.bg_rgb)
         txt = self.cap_edit.text().strip()
         if self.c_date.isChecked(): txt = (txt + "   " if txt else "") + datetime.date.today().strftime("%d-%m-%Y")
         return add_caption(im, txt)
@@ -4644,6 +4820,10 @@ class AIMixin:
                     restore=("auto" if self.c_ai_restore.isChecked() and not basic else False), upscale=("auto" if self.c_ai_up.isChecked() else False),
                     bg_rgb=self.bg_rgb, edge=self.s_edge.value(), face=self.fi_orig)
         img = self.orig
+        # keep the user's own edits (upscale, retouch, repaired background ...) when something was edited since the last AI run
+        if self.c_ai_current.isChecked() and self.rgb is not self.orig and self._edit_count != self._pipe_edit_count:
+            img = self.rgb; opts["face"] = self.finfo
+            if self.alpha is not None and self.alpha.size == self.rgb.size and bg_on: opts["alpha"] = np.array(self.alpha)
         self.banner.start("Starting...", True)
         def fn(ctx): return run_ai_pipeline(img, preset, opts, ctx, HUB)
         def ok(res): self._apply_pipeline_result(res)
@@ -4651,7 +4831,7 @@ class AIMixin:
         if not self.runner.submit(fn, ok, fail): self.banner.idle()
 
     def _apply_pipeline_result(self, res):
-        self.push()
+        self.push(); self._pipe_edit_count = self._edit_count; self.cloth = None
         self.rgb, self.alpha, self.finfo, self.face = res["rgb"], res["alpha"], res["fi"], res["face"]
         if self.fi_orig is None: pass
         self.hair_mask = None; self.box = res["box"]; self.base_h = self.box[2]; self._reset_zoom_tilt()
@@ -4722,7 +4902,9 @@ class AIMixin:
                     "smooth": self.c_smooth.isChecked(),
                     "smooth_strength": self.s_smooth.value(), "tone": self.c_tone.isChecked(), "tone_strength": self.s_tone.value(),
                     "shine": self.c_shine.isChecked(), "bg": self.c_bg.isChecked(), "hair": self.c_hair.isChecked(), "hair_strength": self.s_hair.value()}
-        arr = np.array(self.orig if self.orig is not None else self.rgb); face = self.face; model = MODELS[self.model_box.currentText()]; hrgb = self.hair_rgb
+        use_cur = self.c_ai_current.isChecked() and self.rgb is not self.orig and self._edit_count != self._pipe_edit_count
+        arr = np.array(self.rgb if (use_cur or self.orig is None) else self.orig); face = self.face; model = MODELS[self.model_box.currentText()]; hrgb = self.hair_rgb
+        finfo = self.finfo
         def apply(res):
             a, alpha, hm, notes = res
             self.set_rgb(a); self.alpha = alpha; self.hair_mask = hm
@@ -4731,7 +4913,7 @@ class AIMixin:
             if self.c_manual.isChecked() or (self.face is None and self.c_crop.isChecked()): self.open_editor()
             else: self.apply_crop()
             self.banner.done("Auto finished" + ("  [" + " | ".join(notes) + "]" if notes else ""))
-        self._bg_op("Auto processing...", lambda ctx: run_auto_pipeline(arr, face, settings, model, hrgb), apply)
+        self._bg_op("Auto processing...", lambda ctx: run_auto_pipeline(arr, face, settings, model, hrgb, finfo), apply)
 
     # ---------- AI model jobs ----------
     def _load_key(self, key):
@@ -4739,7 +4921,98 @@ class AIMixin:
         if r["kind"] == "insightface": HUB._insight()
         elif r["kind"] == "rembg": HUB._rembg_session(key)
         elif key == "gfpgan": HUB._gfpgan()
+        elif key == "gfpgan_onnx": HUB._onnx_sess(key)
         elif key == "realesrgan": HUB._esrgan()
+
+    # ---------- apply any installed AI model from the menu ----------
+    def apply_model(self, key, engine=None):
+        """key = MODEL_REGISTRY key. Not installed -> offer the download, then apply automatically."""
+        if not self.need_img(): return
+        r = MODEL_REGISTRY[key]
+        if not HUB.lib_available(key):
+            return QMessageBox.information(self, "AI Models", "%s needs a Python package that is not installed.\nOpen 'AI Models' for details / install notes." % r["label"])
+        if not HUB.is_installed(key):
+            if ask_yes_no(self, "AI Models", "%s is not downloaded yet (%s).\n\nDownload it now and then apply?" % (r["label"], r["size"])):
+                self.download_model(key, lambda: self.apply_model(key, engine) if HUB.is_installed(key) else None)
+            return
+        if key in BG_MODEL_KEYS:
+            for i, (n, v) in enumerate(MODELS.items()):
+                if v == key: self.model_box.setCurrentIndex(i)
+            self.m_bg_remove()
+        elif key in UPSCALE_KEYS: self.m_upscale(engine or key)
+        elif key in RESTORE_KEYS: self.m_face_ai(key)
+        elif key == "u2net_cloth_seg": self.m_dress_ai()
+        else: QMessageBox.information(self, "AI Models", "%s works automatically inside the AI Photo workflow." % r["label"])
+
+    def fill_ai_menu(self):
+        mn = self.ai_apply_menu; mn.clear()
+        def item(menu, text, key, engine=None):
+            ok = HUB.is_installed(key) and HUB.lib_available(key)
+            menu.addAction(("✔ " if ok else "⬇ ") + text).triggered.connect(lambda _=False, k=key, e=engine: self.apply_model(k, e))
+        sub = mn.addMenu("Remove Background")
+        for name, v in MODELS.items(): item(sub, name, v)
+        sub = mn.addMenu("Upscale 2x")
+        item(sub, "FAST GPU (Real-ESRGAN ncnn) - recommended", "esrgan_ncnn", "esrgan_ncnn")
+        item(sub, "Best quality GPU (ncnn x4plus, slower)", "esrgan_ncnn", "esrgan_ncnn_hq")
+        item(sub, "Real-ESRGAN (torch - slow on CPU)", "realesrgan", "realesrgan")
+        sub = mn.addMenu("Face Restore")
+        item(sub, "GFPGAN ONNX (fast, no torch)", "gfpgan_onnx"); item(sub, "GFPGAN (torch)", "gfpgan")
+        sub = mn.addMenu("Dress")
+        item(sub, "AI Dress Fit (shirt / suit / tie PNG)", "u2net_cloth_seg")
+        mn.addSeparator(); mn.addAction("Open AI Models window (download / GPU)").triggered.connect(lambda _=False: self.open_models())
+
+    # ---------- AI dress fit ----------
+    def m_dress_ai(self):
+        """Finds the customer's old clothes (AI), fits the chosen shirt / suit / tie PNG to the shoulders and paints out what sticks out."""
+        if not self.need_img(): return
+        if self.photo_base is None:
+            return QMessageBox.information(self, "AI Dress Fit", "Make the photo first (AI Photo or Crop), then press AI Dress Fit.")
+        item = self.dress_list.currentItem() if hasattr(self, "dress_list") else None
+        path = item.data(Qt.UserRole) if item is not None else self.dress_path
+        if not path or not os.path.isfile(path):
+            self.tabs.setCurrentIndex(3)
+            return QMessageBox.information(self, "AI Dress Fit", "Choose a shirt / suit / tie in the DRESS tab first (click it), then press AI Dress Fit.")
+        if not HUB.lib_available("u2net_cloth_seg"):
+            return QMessageBox.information(self, "AI Dress Fit", "Needs the 'rembg' package (pip install rembg onnxruntime).")
+        if not HUB.is_installed("u2net_cloth_seg"):
+            if ask_yes_no(self, "AI Dress Fit", "The clothes-finder AI model (~170 MB) is not downloaded yet.\n\nDownload it now?"):
+                self.download_model("u2net_cloth_seg", lambda: self.m_dress_ai() if HUB.is_installed("u2net_cloth_seg") else None)
+            return
+        photo = np.array(self.photo_base.convert("RGB")); boxkey = tuple(round(v, 2) for v in self.box)
+        def fn(ctx):
+            ctx.msg("AI is looking for the clothes...")
+            fi = detect_face_info(photo, HUB)
+            try: cm = HUB.cloth_mask(photo)
+            except Exception as e:
+                log.warning("cloth mask failed: %s", e); cm = None
+            return fi, cm
+        def apply(res):
+            fi, cm = res
+            try: d = Image.open(path).convert("RGBA")
+            except Exception as e: return QMessageBox.warning(self, "AI Dress Fit", "Cannot open the dress file.\n%s" % e)
+            H, W = photo.shape[:2]; sc, yo, xo = 100.0, 0.0, 0.0; note = ""
+            if fi is not None:
+                fx, fy, fw, fh = fi["bbox"]; chin_x, chin_y = fi["chin"]
+                sw = None
+                if cm is not None:
+                    below = cm[int(min(H - 1, chin_y)):] > 0.5
+                    cols = np.where(below.sum(0) > 2)[0]
+                    if len(cols) > 10: sw = float(cols.max() - cols.min())
+                target_w = (sw if (sw and sw > 1.8 * fw) else 2.6 * fw) * 1.06
+                sc = max(40.0, min(220.0, target_w / W * 100.0))
+                dw = W * sc / 100.0; dh = d.height * dw / d.width
+                top = chin_y + 0.08 * fh
+                need = H - top
+                if dh < need: sc = min(220.0, need * d.width / d.height / W * 100.0); dw = W * sc / 100.0; dh = d.height * dw / d.width
+                yo = max(0.0, (top - (H - dh)) / H * 100.0); xo = (chin_x - W / 2.0) / W * 100.0
+            else: note = "  (face not found - default position, adjust with the sliders)"
+            if cm is None: note += "  (old clothes could not be detected - dress only overlaid)"
+            for sl, v in ((self.s_dress, sc), (self.s_dress_y, yo), (self.s_dress_x, xo)):
+                sl.blockSignals(True); sl.setValue(int(round(max(sl.minimum(), min(sl.maximum(), v))))); sl.blockSignals(False)
+            self.dress = d; self.dress_path = path
+            self.cloth = (Image.fromarray((np.clip(cm, 0, 1) * 255).astype(np.uint8)), boxkey) if cm is not None else None
+            self._apply_adjust_now(); self.banner.done("Dress fitted: %s%s" % (os.path.splitext(os.path.basename(path))[0], note))
+        self._bg_op("AI Dress Fit...", fn, apply, history=False)
 
     def download_model(self, key, cb=None):
         if self.runner.busy: return QMessageBox.information(self, "AI Models", "Please wait - a job is running.")
@@ -5021,6 +5294,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         self.photo_base = self.photo = self.sheet = None; self.sheets = []; self.view_mode = "photo"
         self._rev = 0; self._cache = {}; self._pm_cache = []
         self.repair_active = False; self._full_preview = False; self._ext = None; self._ext_keep_alpha = True
+        self._edit_count = 0; self._pipe_edit_count = -1; self.cloth = None
         self._fix_queue = []; self._dirty = False; self._saved_rev = 0; self._pending_face_action = None; self._report = []
         self.job_id = None; self.job_folder = None; self.src_path = self.inbox_path = None; self._last_saved_dir = None
         self.doc_studio = None; self._dress_cache = {}
@@ -5115,6 +5389,8 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
             return c
         self.c_ai_bg = chk("Remove background"); self.c_ai_enh = chk("Clean and enhance photo"); self.c_ai_skin = chk("Natural skin retouch (no auto pimple removal)")
         self.c_ai_restore = chk("AI Face Restore - only when the face is blurry"); self.c_ai_up = chk("Upscale - only when the photo is small")
+        self.c_ai_current = chk("Keep my edits (upscale / retouch / repaired background) when I run AI again", True,
+                                "ON: AI starts from your edited photo.  OFF: AI always starts from the original customer photo.")
         self.c_auto_open = chk("Auto-detect face after opening a photo", bool(SETTINGS.get("auto_ai", False)))
         self.c_auto_open.toggled.connect(lambda v: (SETTINGS.__setitem__("auto_ai", bool(v)), save_settings()))
         self.s_edge = hslider(0, 100, 60)
@@ -5291,6 +5567,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         for w in (QLabel("Customer"), self.e_customer, self.e_phone, self.e_service, self.e_price): rowC.addWidget(w)
         rowC.addWidget(btn("💾 Save Job", self.save_job, "", "Record this customer and keep the files", 30)); rowC.addWidget(btn("📋 Jobs", self.open_jobs, "", "Customer jobs (Ctrl+J)", 30))
         rowC.addWidget(btn("৳ Accounts", self.open_accounts, "", "Today's income and expenses", 30)); rowC.addWidget(self.job_lbl); rowC.addStretch(1)
+        rowC.addWidget(btn("✨ AI Studio", self.open_ai_studio, BTN_PURPLE, "Upscale, face restore, object removal, cutout, old photo ...", 30))
         rowC.addWidget(btn("AI Models", self.open_models, "", "Installed / missing / GPU", 30))
         bar = QFrame(); bar.setObjectName("Bar"); bl = QVBoxLayout(bar); bl.setContentsMargins(8, 8, 8, 8); bl.setSpacing(6); bl.addLayout(rowA); bl.addLayout(rowB); bl.addLayout(rowC)
         # --- left: preview ---
@@ -5320,7 +5597,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         l.addWidget(group("🤖 AI AGENTS", [btn("🤖 Smart Agent  (photo or document?)", self.agent_smart, BTN_PURPLE, "Looks at the picture, decides if it is a passport photo or an ID card / paper, and does the right job", 42),
                                            btn("🩺 Photo Doctor  (find + fix problems)", self.agent_doctor, BTN_BLUE, "Colour cast, dark / bright, flat, noise, soft, red-eye - fixes only what is really wrong", 42),
                                            _lbl("Smart Agent: ID card on a table → opens the scanner. Face photo → passport workflow.\nPhoto Doctor: checks the photo like an expert and fixes only what is wrong.", True, "color:#666;")]))
-        l.addWidget(group("AI OPTIONS  (normally leave all ON)", [self.c_ai_bg, self.c_ai_enh, self.c_ai_skin, self.c_ai_restore, self.c_ai_up, self.c_auto_open]))
+        l.addWidget(group("AI OPTIONS  (normally leave all ON)", [self.c_ai_bg, self.c_ai_enh, self.c_ai_skin, self.c_ai_restore, self.c_ai_up, self.c_ai_current, self.c_auto_open]))
         l.addWidget(group("FACE", [self.face_lbl, row(btn("Face Auto Detect (F7)", self.m_face_detect), btn("Face Manual (F8)", self.m_face_manual, BTN_BLUE)),
                                    _lbl("Eyes, nose, mouth and chin are found automatically. If the face is not found, draw a box with 'Face Manual'.")]))
         l.addWidget(group("OLD AUTO LIST  (v2 - choose your own steps)", [self.c_crop, self.c_manual, self.c_bg, self.c_enh, self.c_smooth, self.c_tone, self.c_shine, self.c_face, self.c_hair,
@@ -5385,6 +5662,8 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         l = QVBoxLayout()
         l.addWidget(group("SHIRT / SUIT / TIE / COAT", [self.dress_cat, self.dress_list, _lbl("Double-click a dress. Put transparent PNGs in the 'dress' folder (sub-folders Shirt, Suit, Tie, Coat).", True, "color:#666;"),
                                                         row(btn("Custom PNG...", self.pick_dress), btn("Remove dress", lambda: self.load_dress(None))), btn("Reload list", self.refresh_dress_tab)]))
+        l.addWidget(group("🤖 AI DRESS FIT", [btn("👔  AI Dress Fit  (selected shirt / suit / tie)", self.m_dress_ai, BTN_PURPLE, "AI finds the old clothes, fits the new dress to the shoulders and removes what sticks out", 44),
+                                              _lbl("1) Make the photo (AI Photo / Crop)  2) click a dress above  3) press AI Dress Fit. Then fine-tune with the sliders below.", True, "color:#666;")]))
         l.addWidget(group("DRESS POSITION", [QLabel("Size"), self.s_dress, QLabel("Up / Down"), self.s_dress_y, QLabel("Left / Right"), self.s_dress_x]))
         l.addStretch(1); return _scroll(l)
 
@@ -5426,11 +5705,15 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         add(m, "Undo", self.undo, "Ctrl+Z"); add(m, "Redo", self.redo, "Ctrl+Y"); add(m, "Reset to Original", self.reset_orig); add(m, "Original / Result", self.toggle); m.addSeparator()
         add(m, "Open in Photoshop", self.open_in_photoshop, "Ctrl+Shift+P"); add(m, "Open Edited Photo With...", self.show_ext_menu); add(m, "Re-import Edited Photo", self.reimport_external)
         m = mb.addMenu("&AI Tools")
+        self.ai_apply_menu = m.addMenu("🧠 AI Models  (apply / download)"); self.ai_apply_menu.aboutToShow.connect(self.fill_ai_menu); self.fill_ai_menu(); m.addSeparator()
+        sm = m.addMenu("✨ AI Studio  (Ctrl+Shift+I)"); add(sm, "Open AI Studio...", self.open_ai_studio, "Ctrl+Shift+I")
+        for _k, _t in (_AIS.TOOL_MENU if _AIS else []): add(sm, _t, lambda k=_k: self.open_ai_studio(k))
+        m.addSeparator()
         add(m, "AI Visa Photo", self.ai_visa); add(m, "AI ID Photo", self.ai_id); add(m, "⚡ Auto Fix", self.fix_clicked, "F9"); m.addSeparator()
         add(m, "🤖 Smart Agent (photo or document?)", self.agent_smart, "F10"); add(m, "🩺 Photo Doctor", self.agent_doctor, "Ctrl+Shift+H"); add(m, "Fix Colour Cast", self.m_awb); add(m, "Fix Dark / Backlight", self.m_lift_shadows)
         add(m, "Reduce Noise", self.m_denoise); add(m, "Sharpen", self.m_sharpen_photo); add(m, "Red-Eye Fix", self.m_redeye); m.addSeparator()
         add(m, "AUTO CHALAO (checklist)", self.run_auto, "F5"); add(m, "Face Auto Detect", self.m_face_detect, "F7"); add(m, "Face Manual (box)", self.m_face_manual, "F8"); m.addSeparator()
-        add(m, "Photo Enhance PRO", self.m_enhance); add(m, "Auto Enhance", self.m_auto_enhance); add(m, "AI Face Restore", self.m_face_ai); add(m, "AI Upscale 2x", self.m_upscale); m.addSeparator()
+        add(m, "Photo Enhance PRO", self.m_enhance); add(m, "Auto Enhance", self.m_auto_enhance); add(m, "AI Face Restore", self.m_face_ai); add(m, "AI Upscale 2x (fast)", self.m_upscale); add(m, "👔 AI Dress Fit", self.m_dress_ai); m.addSeparator()
         add(m, "Skin Retouch (natural)", self.m_retouch); add(m, "Skin Smooth (soft)", self.m_smooth); add(m, "Skin Tone Up", self.m_tone); add(m, "Reduce oily shine", self.m_shine)
         add(m, "Pimple / Spot Heal (click)", self.m_pimple); add(m, "Retouch Studio (click to heal)", lambda: self.open_retouch("heal"), "F6"); m.addSeparator()
         hm = m.addMenu("Hair Color")
@@ -5440,6 +5723,7 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         m = mb.addMenu("&Studio")
         add(m, "Crop (Photoshop style)", self.open_editor); self.dress_menu = m.addMenu("Dress / Suit (PNG)"); self.dress_menu.aboutToShow.connect(self.fill_dress_menu)
         add(m, "Black && White on/off", lambda: self.c_bw.setChecked(not self.c_bw.isChecked())); add(m, "Sheet Layout", self.do_layout, "Ctrl+L"); add(m, "Document Studio", self.open_doc_studio, "Ctrl+D")
+        add(m, "🖼 Layout Studio  (multi-page, Bank Photo Duet, ID Card, print)", self.open_layout_studio, "Ctrl+Shift+L"); add(m, "Send this photo to Layout Studio", self.send_to_layout_studio)
         m = mb.addMenu("&Shop")
         add(m, "New Job...", self.job_new); add(m, "Customer Jobs", self.open_jobs, "Ctrl+J"); add(m, "Accounts (income / expense)", self.open_accounts); m.addSeparator()
         add(m, "New size / preset...", self.preset_new); add(m, "Edit this preset", self.preset_edit); add(m, "Delete / reset preset", self.preset_delete)
@@ -5451,10 +5735,31 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         QMessageBox.about(self, APP_NAME, "<h3>%s</h3>One-click AI passport photo, print studio, document studio, customer jobs and shop accounts.<br>Data folder: %s" % (APP_TITLE, APP_DIR))
 
     # ================= dialogs =================
+    def open_ai_studio(self, tool=None):
+        if _AIS is None: return QMessageBox.information(self, APP_NAME, "AI Studio is not available.\nKeep 'ripon_ai_studio.py' next to this program file.\n\n%s" % _AIS_ERR)
+        if not self.need_img(): return
+        if self.runner.busy: return self.status_msg("Please wait - a job is running.")
+        if self.repair_active or self.stack.currentIndex() in (1, 2, 3): return self.status_msg("Finish Crop / Retouch / Face-pick first (Enter or Esc), then open AI Studio.")
+        try: _AIS.open_studio(self, tool if isinstance(tool, str) else None)
+        except Exception as e:
+            log.error("AI Studio failed: %s\n%s", e, traceback.format_exc()); QMessageBox.warning(self, APP_NAME, "AI Studio problem:\n%s" % e)
     def open_jobs(self): JobsDialog(self).exec()
     def open_accounts(self): AccountsDialog(self).exec()
     def open_models(self):
         self.models_dlg = ModelsDialog(self); self.models_dlg.exec()
+    # ---- Layout Studio (extra files next to this program: ripon_layout_studio.py, ripon_core.py, ripon_studio_*.py) ----
+    def open_layout_studio(self):
+        try:
+            import ripon_layout_studio as _LS
+            return _LS.open_studio(self)
+        except Exception as e:
+            log.error("Layout Studio failed: %s\n%s", e, traceback.format_exc())
+            QMessageBox.warning(self, APP_NAME, "Layout Studio could not start.\nKeep these files next to this program:\n"
+                                "ripon_layout_studio.py, ripon_core.py, ripon_studio_base.py, ripon_studio_tools.py, ripon_studio_panels.py\n\n%s: %s" % (e.__class__.__name__, e))
+    def send_to_layout_studio(self):
+        if not self.need_img(): return
+        w = self.open_layout_studio()
+        if w is not None: w.import_from_host()
     def open_doc_studio(self):
         if self.doc_studio is None: self.doc_studio = DocStudio(self)
         self.doc_studio.show(); self.doc_studio.raise_()
@@ -5471,6 +5776,15 @@ class AppV3(CoreMixin, EditMixin, OutputMixin, AIMixin, RepairMixin, ExternalMix
         save_settings(); Recovery.end()                       # clean exit: nothing to recover next time
         threading.Timer(4.0, lambda: os._exit(0)).start()     # never hang on a stuck model
         e.accept()
+
+# ---- AI Studio (optional extra file; the program works exactly as before without it) ----
+_AIS = None; _AIS_ERR = ""
+try:
+    import ripon_ai_studio as _AIS
+    _AIS.bind(globals())
+except Exception as _e:
+    _AIS = None; _AIS_ERR = "%s: %s" % (_e.__class__.__name__, _e)
+    log.warning("AI Studio not loaded: %s", _AIS_ERR)
 
 def _excepthook(t, v, tb):
     log.error("UNCAUGHT: %s", "".join(traceback.format_exception(t, v, tb)))

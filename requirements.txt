@@ -1,16 +1,12 @@
-# Ripon Computer - Photo Studio
-# Install:  pip install -r requirements.txt
-
+# Ripon Computer - AI Photo Studio + Layout Studio   (Windows 10/11, Python 3.10 - 3.14)
 PySide6
 opencv-python
 numpy
-Pillow
+pillow
 rembg
 onnxruntime
-
-# ---- Optional AI (GPU/torch lagbe, na install korleo software cholbe) ----
-# AI Face Restore ar AI Upscale 2x er jonno, niche # tule dao:
-# torch
-# torchvision
-# gfpgan
-# realesrgan
+# ---- optional ----
+# pytesseract                 # read-only OCR in Document restoration (also install the Tesseract-OCR program, tick Bengali)
+# onnxruntime-directml        # GPU on any Windows GPU:   pip uninstall onnxruntime  then  pip install onnxruntime-directml
+# onnxruntime-gpu             # NVIDIA GPU
+# pypdf                       # only for running test_core.py
